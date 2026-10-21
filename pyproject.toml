@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "srs-analysis-helper"
+version = "0.1.0"
+description = "Deterministic 5G NR SRS diagnostic data foundation"
+requires-python = ">=3.12"
+dependencies = ["duckdb==1.4.1"]
+
+[project.scripts]
+srs-helper = "srs_helper.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["srs_helper*"]

@@ -1,0 +1,3 @@
+# Runtime dependency closure for the verified Python 3.12 / Windows environment.
+# DuckDB has no transitive Python dependencies. Install: pip install -r requirements.lock
+duckdb==1.4.1
