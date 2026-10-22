@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 import duckdb
+from .database import open_dataset
 
 
 @dataclass(frozen=True)
@@ -15,6 +16,7 @@ class Scope:
     resource_id: int | None = None
     start: datetime | None = None
     end: datetime | None = None
+    phy_cell_inst: int | None = None
 
     def where(self):
         if any(value is not None and value.tzinfo is not None for value in (self.start, self.end)):
@@ -25,6 +27,7 @@ class Scope:
         for column, value, operator in [
             ("logicCellId", self.logic_cell_id, "="), ("ue_uid", self.ue_uid, "="),
             ("crnti", self.crnti, "="), ("resourceId", self.resource_id, "="),
+            ("phyCellInst", self.phy_cell_inst, "="),
             ("event_ts", self.start, ">="), ("event_ts", self.end, "<")]:
             if value is not None:
                 conditions.append(f"{column} {operator} ?")
@@ -35,10 +38,8 @@ class Scope:
 def summarize(dataset_dir, scope=None, dataset_id=None):
     scope = scope or Scope()
     where, parameters = scope.where()
-    with duckdb.connect(str(Path(dataset_dir) / "analysis.duckdb"), read_only=True,
-                        config={"enable_external_access": "false"}) as con:
-        meta = json.loads(con.execute("SELECT metadata FROM _etl_meta").fetchone()[0])
-        if meta["status"] not in {"READY", "PARTIAL_READY"} or meta["rule_version"] != "m1.2":
+    with open_dataset(dataset_dir) as (con, meta):
+        if meta["status"] not in {"READY", "PARTIAL_READY"} or meta["rule_version"] not in {"m1.2","m1.3"}:
             raise ValueError("Dataset is not ready or has an unsupported schema version")
         if dataset_id is not None and dataset_id != meta["dataset_id"]:
             raise ValueError("Dataset identity mismatch")
@@ -48,7 +49,11 @@ def summarize(dataset_dir, scope=None, dataset_id=None):
         excluded_time = con.execute("SELECT count(*) FROM l4_ue_resource_ts WHERE event_ts IS NULL").fetchone()[0] if scope.start or scope.end else 0
         def records(sql):
             cursor = con.execute(sql)
-            return [dict(zip([d[0] for d in cursor.description], row)) for row in cursor.fetchall()]
+            names = [d[0] for d in cursor.description]
+            rows = cursor.fetchmany(100001)
+            if len(rows)>100000:
+                raise ValueError("More than 100,000 summary groups; narrow the analysis scope")
+            return [dict(zip(names, row)) for row in rows]
         streams = records("""
             SELECT r.logicCellId,r.ue_uid,r.resourceId,s.streamId,count(*) AS sample_cnt,
               count(s.instBfSinrGain) AS gain_valid_cnt,avg(s.instBfSinrGain) AS gain_avg,
@@ -77,6 +82,15 @@ def summarize(dataset_dir, scope=None, dataset_id=None):
             FROM timed GROUP BY logicCellId,ue_uid,resourceId ORDER BY 1,2,3
         """)
         totals = dict(con.execute("SELECT ue_uid,count(DISTINCT record_id) FROM scoped WHERE ue_uid IS NOT NULL GROUP BY ue_uid").fetchall())
+        cell_tf = records("""SELECT logicCellId,slot_in_frame,freqRbStart,freqRbNum,
+            count(*) AS sample_cnt,count(DISTINCT ue_uid) AS session_cnt,
+            count(usrRsrp) AS rsrp_valid_cnt,avg(usrRsrp) AS rsrp_avg,
+            count(srsUeNiDb) AS ni_valid_cnt,avg(srsUeNiDb) AS ni_avg,
+            quantile_cont(srsUeNiDb,0.9) AS ni_p90,max(srsUeNiDb) AS ni_max,
+            sum(is_suspicious::INT) AS suspicious_cnt,avg(is_suspicious::INT) AS suspicious_ratio,
+            sum(has_missing_measurement::INT) AS missing_cnt,avg(has_missing_measurement::INT) AS missing_ratio,
+            sum(has_parse_error::INT) AS parse_error_cnt,min(event_ts) AS start_time,max(event_ts) AS end_time
+            FROM scoped GROUP BY logicCellId,slot_in_frame,freqRbStart,freqRbNum ORDER BY 1,2,3,4""")
         by_group = {}
         for stream in streams:
             by_group.setdefault((stream["logicCellId"], stream["ue_uid"], stream["resourceId"]), []).append(stream)
@@ -94,4 +108,4 @@ def summarize(dataset_dir, scope=None, dataset_id=None):
                 "flow_valid_count": baseline[0], "session_assigned_count": baseline[1],
                 "rsrp_valid_count": baseline[2], "ni_valid_count": baseline[3],
                 "unlocated_time_count_in_scope": baseline[4], "dataset_unlocated_time_excluded": excluded_time,
-                "groups": groups, "streams": streams}
+                "groups": groups, "streams": streams,"cell_tf":cell_tf}

@@ -5,13 +5,15 @@ import json
 import math
 import shutil
 import uuid
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
 import duckdb
+import pyarrow as pa
 from .schema import bindings, column_catalog
 
-RULE_VERSION = "m1.2"
+RULE_VERSION = "m1.3"
 GAIN_FIELDS = tuple(f"instBfSinrGain[{i}]" for i in range(4))
 NUMBERS = ("uwTtiCnt1", "logicCellId", "crnti", "phyCellInst", "resourceId",
            "frmNum", "subFrmNum", "slot", "freqRbStart", "freqRbNum", "usrRsrp", "srsUeNiDb") + GAIN_FIELDS
@@ -24,6 +26,19 @@ def digest(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def insert_batch(con, table, batch):
+    """Bounded Arrow transfer instead of one SQL execution per wide record."""
+    if not batch:
+        return
+    names = [d[0] for d in con.execute(f"SELECT * FROM {table} LIMIT 0").description]
+    arrow = pa.Table.from_arrays([pa.array(column) for column in zip(*batch)], names=names)
+    con.register("incoming_batch", arrow)
+    try:
+        con.execute(f"INSERT INTO {table} SELECT * FROM incoming_batch")
+    finally:
+        con.unregister("incoming_batch")
 
 
 def normalize(row, header, contract, source, file_hash, row_id, dataset_id, positions=None):
@@ -128,6 +143,7 @@ def build_dataset(input_dir, storage, contract):
         con.execute("CREATE TABLE field_catalog (source_file VARCHAR,column_ordinal INTEGER,raw_name VARCHAR,"
                     "family VARCHAR,array_index INTEGER,array_extent INTEGER,domain VARCHAR,"
                     "present_count BIGINT,missing_count BIGINT,availability VARCHAR)")
+        con.execute("CREATE TABLE l2_extra_numeric (record_id VARCHAR,field_name VARCHAR,value DOUBLE,parse_state VARCHAR)")
         numeric_schema = ", ".join(f'"{n}" {"BIGINT" if n in INTEGERS else "DOUBLE"}' for n in NUMBERS)
         con.execute("CREATE TABLE l2_standardized (record_id VARCHAR PRIMARY KEY, source_file VARCHAR, "
                     "source_file_hash VARCHAR, file_row_id BIGINT, raw_values JSON, error_reasons JSON, "
@@ -144,21 +160,39 @@ def build_dataset(input_dir, storage, contract):
                     reader = csv.reader(stream, delimiter=contract["delimiter"], strict=True)
                     header = next(reader)
                     positions = bindings(header, contract, NUMBERS)
+                    folded = Counter(name.casefold() for name in header)
+                    reserved = {name.casefold() for name in NUMBERS} | {"uwdata","uwdate","uwtime","record_id","source_file","event_ts","ue_uid","streamid"}
+                    mapped_positions = set(positions.values())
+                    extras = [(i,name) for i,name in enumerate(header) if i not in mapped_positions and folded[name.casefold()]==1
+                              and name.casefold() not in reserved and "[" not in name and name and len(name)<=100]
                     catalog = column_catalog(header, mapping)
                     present = [0] * len(header)
                     entry["columns"] = header
                     batch = []
+                    extra_batch = []
                     for row_id, row in enumerate(reader, 1):
                         for idx, value in enumerate(row[:len(header)]):
                             present[idx] += value.strip() not in contract["null_values"]
                         batch.append(normalize(row, header, contract, entry["source_file"],
                                                entry["sha256"], row_id, dataset_id, positions))
+                        for idx,name in extras:
+                            if idx>=len(row) or row[idx].strip() in contract["null_values"]:
+                                continue
+                            try:
+                                value = float(row[idx])
+                                status = "VALID" if math.isfinite(value) else "NON_FINITE"
+                            except ValueError:
+                                value,status = None,"PARSE_ERROR"
+                            extra_batch.append((batch[-1][0],name,value if status=="VALID" else None,status))
                         if len(batch) == 2000:
-                            con.executemany("INSERT INTO l2_standardized VALUES (" + ",".join(["?"] * len(batch[0])) + ")", batch)
+                            insert_batch(con, "l2_standardized", batch)
+                            insert_batch(con, "l2_extra_numeric", extra_batch)
                             batch.clear()
+                            extra_batch.clear()
                     if batch:
-                        con.executemany("INSERT INTO l2_standardized VALUES (" + ",".join(["?"] * len(batch[0])) + ")", batch)
-                    con.executemany("INSERT INTO field_catalog VALUES (?,?,?,?,?,?,?,?,?,?)", [
+                        insert_batch(con, "l2_standardized", batch)
+                        insert_batch(con, "l2_extra_numeric", extra_batch)
+                    insert_batch(con, "field_catalog", [
                         (entry["source_file"], *col, present[col[0]], row_id-present[col[0]],
                          "NO_RECORDS" if row_id == 0 else "ALL_NULL" if present[col[0]] == 0 else
                          "AVAILABLE" if present[col[0]] == row_id else "PARTIAL_MISSING") for col in catalog])

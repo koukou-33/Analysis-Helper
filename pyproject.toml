@@ -4,10 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "srs-analysis-helper"
-version = "0.1.0"
-description = "Deterministic 5G NR SRS diagnostic data foundation"
+version = "0.2.0"
+description = "Evidence-first 5G NR SRS diagnostic workbench"
 requires-python = ">=3.12"
-dependencies = ["duckdb==1.4.1"]
+dependencies = [
+  "duckdb==1.4.1", "pyarrow==21.0.0", "pydantic==2.12.3", "PyYAML==6.0.3",
+  "Pillow==11.3.0", "rank-bm25==0.2.2", "qdrant-client==1.15.1",
+  "langgraph==1.0.1", "langgraph-checkpoint-sqlite==3.0.0", "langchain-core==1.0.1",
+  "httpx==0.28.1", "python-dotenv==1.1.1", "streamlit==1.50.0", "plotly==6.3.1",
+  "pandas==2.3.3", "portalocker==3.2.0", "sqlglot==27.28.1", "kaleido==1.1.0"
+]
 
 [project.scripts]
 srs-helper = "srs_helper.cli:main"

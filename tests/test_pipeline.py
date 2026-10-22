@@ -2,6 +2,7 @@ import csv
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import duckdb
@@ -139,6 +140,13 @@ class PipelineTests(unittest.TestCase):
         _, meta = self.build()
         self.assertEqual(meta["status"], "FAILED")
         self.assertIn("Ambiguous mapped field", meta["files"][0]["error"])
+
+    def test_unstable_snapshot_is_not_published_as_ready(self):
+        self.write([self.row()])
+        with patch("srs_helper.pipeline.digest",side_effect=["before","changed"]*3):
+            _,meta = build_dataset(self.inputs,self.root/"storage",self.contract)
+        self.assertEqual(meta["status"],"FAILED")
+        self.assertIn("Source changed",meta["files"][0]["error"])
 
 
 if __name__ == "__main__":
