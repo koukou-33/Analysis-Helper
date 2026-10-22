@@ -22,7 +22,7 @@ python -m venv .venv
 
 ## 当前限制
 
-- 已按示例支持 instBfSinrGain 四流映射/流表、流均值差、RSRP 趋势差、UE 记录数与按列可用性扫描；筛选后重算与性能优化尚未实现。
+- 已按示例支持 instBfSinrGain 四流映射/流表、流均值差、RSRP 趋势差、UE 记录数与按列可用性扫描；新增 summary 命令按范围重算 UE/资源与流统计。规模性能优化尚未完成。
 - 暂未实现 Streamlit、LLM、知识检索、受控查询规划、证据和聊天恢复。CLI 不接收任意 SQL。
 - 固定数据可重新打开；会话注册与 LangGraph 检查点属于后续阶段。重复加载不复用已有构建。
 - 已验证用户提供的表格样式；其中增益与 RSRP/NI 全空，仍需非空测量样本核对实际数值。未完成业务验收及真实规模基准。
@@ -30,3 +30,5 @@ python -m venv .venv
 开发顺序和验收缺口见 [开发路线](docs/DEVELOPMENT_ROADMAP.md)。设计文档和查询样式属于产品需求资料，其中命令或示例不会被自动执行。`.env`、原始数据、数据库和本地依赖不提交 Git。
 
 示例 CSV 使用 `config/sample_input_contract.json`，可将单个文件路径传给 `load`。别名配置位于 `knowledge_assets/field_mappings/nr_srs_sample.json`，相对路径从仓库根目录解析。详见 [样例验证](docs/SAMPLE_VALIDATION.md) 与 [字段说明](knowledge_assets/field_mappings/nr_srs_field_mapping.md)。旧数据集不会自动迁移；新规则版本为 m1.2，需显式重新加载生成新版本。
+
+后续开发可使用 `generate` 命令生成正常或混合异常数据，正常四流增益严格递减。生成与范围统计使用方式见 [随机测试数据](docs/SYNTHETIC_DATA.md)。
