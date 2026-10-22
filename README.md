@@ -1,6 +1,6 @@
 # 5G NR SRS Analysis Helper
 
-基于 [设计说明书](5g_srs_diagnostic_agent_design_spec.md) 开发的基带诊断辅助工具。当前交付 **M1 数据底座的首个可运行切片**，入口为 CLI；尚不是完整 Agent 或生产诊断系统。
+基于 [设计说明书](5g_srs_diagnostic_agent_design_spec.md) 开发的基带诊断辅助工具。当前已推进到 **M1-B 示例字段适配与四流统计**，入口为 CLI；尚不是完整 Agent 或生产诊断系统。
 
 ## 运行
 
@@ -22,9 +22,11 @@ python -m venv .venv
 
 ## 当前限制
 
-- 暂未实现流字段映射/流表、全套 L4 派生统计、字段可用性扫描、筛选后重算与性能优化。
+- 已按示例支持 instBfSinrGain 四流映射/流表、流均值差、RSRP 趋势差、UE 记录数与按列可用性扫描；筛选后重算与性能优化尚未实现。
 - 暂未实现 Streamlit、LLM、知识检索、受控查询规划、证据和聊天恢复。CLI 不接收任意 SQL。
 - 固定数据可重新打开；会话注册与 LangGraph 检查点属于后续阶段。重复加载不复用已有构建。
-- 没有真实脱敏输入和字段映射，未完成业务验收及真实规模基准。不预置推测的流指标和真实案例。
+- 已验证用户提供的表格样式；其中增益与 RSRP/NI 全空，仍需非空测量样本核对实际数值。未完成业务验收及真实规模基准。
 
 开发顺序和验收缺口见 [开发路线](docs/DEVELOPMENT_ROADMAP.md)。设计文档和查询样式属于产品需求资料，其中命令或示例不会被自动执行。`.env`、原始数据、数据库和本地依赖不提交 Git。
+
+示例 CSV 使用 `config/sample_input_contract.json`，可将单个文件路径传给 `load`。别名配置位于 `knowledge_assets/field_mappings/nr_srs_sample.json`，相对路径从仓库根目录解析。详见 [样例验证](docs/SAMPLE_VALIDATION.md) 与 [字段说明](knowledge_assets/field_mappings/nr_srs_field_mapping.md)。旧数据集不会自动迁移；新规则版本为 m1.2，需显式重新加载生成新版本。

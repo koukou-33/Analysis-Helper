@@ -9,11 +9,13 @@ from datetime import datetime
 from pathlib import Path
 
 import duckdb
+from .schema import bindings, column_catalog
 
-RULE_VERSION = "m1.1"
+RULE_VERSION = "m1.2"
+GAIN_FIELDS = tuple(f"instBfSinrGain[{i}]" for i in range(4))
 NUMBERS = ("uwTtiCnt1", "logicCellId", "crnti", "phyCellInst", "resourceId",
-           "frmNum", "subFrmNum", "slot", "freqRbStart", "freqRbNum", "usrRsrp", "srsUeNiDb")
-INTEGERS = set(NUMBERS) - {"usrRsrp", "srsUeNiDb"}
+           "frmNum", "subFrmNum", "slot", "freqRbStart", "freqRbNum", "usrRsrp", "srsUeNiDb") + GAIN_FIELDS
+INTEGERS = set(NUMBERS) - {"usrRsrp", "srsUeNiDb", *GAIN_FIELDS}
 
 
 def digest(path):
@@ -24,8 +26,9 @@ def digest(path):
     return h.hexdigest()
 
 
-def normalize(row, header, contract, source, file_hash, row_id, dataset_id):
-    raw = dict(zip(header, row))
+def normalize(row, header, contract, source, file_hash, row_id, dataset_id, positions=None):
+    positions = positions if positions is not None else bindings(header, contract, NUMBERS)
+    raw = {name: row[idx] if idx < len(row) else None for name, idx in positions.items()}
     errors = []
     missing = lambda v: v is None or v.strip() in contract["null_values"]
     values = []
@@ -67,10 +70,18 @@ def normalize(row, header, contract, source, file_hash, row_id, dataset_id):
 
 
 def build_dataset(input_dir, storage, contract):
+    contract = dict(contract)
+    if "field_mapping_file" in contract:
+        contract["field_mapping"] = json.loads(Path(contract["field_mapping_file"]).read_text(encoding="utf-8"))
+    mapping = contract.get("field_mapping", {})
+    if mapping.get("stream_count", 4) != 4 or mapping.get("stream_gain_family", "instBfSinrGain") != "instBfSinrGain" or mapping.get("gain_scale", 1.0) != 1.0:
+        raise ValueError("Only four instBfSinrGain streams with scale 1 are currently supported")
     if contract["flow_presence_column"] != "crnti":
         raise ValueError("Flow presence must use raw crnti")
     root, storage = Path(input_dir).resolve(), Path(storage).resolve()
-    paths = sorted(root.rglob("NR_SRS.*.csv"))
+    paths = [root] if root.is_file() and root.suffix.lower() == ".csv" else sorted(root.rglob("NR_SRS.*.csv"))
+    if root.is_file():
+        root = root.parent
     if not paths:
         raise ValueError("No NR_SRS.*.csv files found")
     dataset_id = str(uuid.uuid4())
@@ -114,6 +125,9 @@ def build_dataset(input_dir, storage, contract):
             {"inputs": manifest, "contract": contract, "rules": RULE_VERSION},
             sort_keys=True).encode()).hexdigest()
         con = duckdb.connect(str(build / "analysis.duckdb"))
+        con.execute("CREATE TABLE field_catalog (source_file VARCHAR,column_ordinal INTEGER,raw_name VARCHAR,"
+                    "family VARCHAR,array_index INTEGER,array_extent INTEGER,domain VARCHAR,"
+                    "present_count BIGINT,missing_count BIGINT,availability VARCHAR)")
         numeric_schema = ", ".join(f'"{n}" {"BIGINT" if n in INTEGERS else "DOUBLE"}' for n in NUMBERS)
         con.execute("CREATE TABLE l2_standardized (record_id VARCHAR PRIMARY KEY, source_file VARCHAR, "
                     "source_file_hash VARCHAR, file_row_id BIGINT, raw_values JSON, error_reasons JSON, "
@@ -129,21 +143,26 @@ def build_dataset(input_dir, storage, contract):
                         encoding=contract["encoding"], newline="") as stream:
                     reader = csv.reader(stream, delimiter=contract["delimiter"], strict=True)
                     header = next(reader)
-                    if len(set(header)) != len(header):
-                        raise ValueError("Duplicate header names")
-                    absent = set(contract["required_identity_columns"]) - set(header)
-                    if absent:
-                        raise ValueError(f"Missing required columns: {sorted(absent)}")
+                    positions = bindings(header, contract, NUMBERS)
+                    catalog = column_catalog(header, mapping)
+                    present = [0] * len(header)
                     entry["columns"] = header
                     batch = []
                     for row_id, row in enumerate(reader, 1):
+                        for idx, value in enumerate(row[:len(header)]):
+                            present[idx] += value.strip() not in contract["null_values"]
                         batch.append(normalize(row, header, contract, entry["source_file"],
-                                               entry["sha256"], row_id, dataset_id))
+                                               entry["sha256"], row_id, dataset_id, positions))
                         if len(batch) == 2000:
                             con.executemany("INSERT INTO l2_standardized VALUES (" + ",".join(["?"] * len(batch[0])) + ")", batch)
                             batch.clear()
                     if batch:
                         con.executemany("INSERT INTO l2_standardized VALUES (" + ",".join(["?"] * len(batch[0])) + ")", batch)
+                    con.executemany("INSERT INTO field_catalog VALUES (?,?,?,?,?,?,?,?,?,?)", [
+                        (entry["source_file"], *col, present[col[0]], row_id-present[col[0]],
+                         "NO_RECORDS" if row_id == 0 else "ALL_NULL" if present[col[0]] == 0 else
+                         "AVAILABLE" if present[col[0]] == row_id else "PARTIAL_MISSING") for col in catalog])
+                    entry["unavailable_mapped_fields"] = sorted(set(NUMBERS) - positions.keys())
                 con.execute("COMMIT")
                 entry.update(status="LOADED", records=row_id)
             except (OSError, UnicodeError, csv.Error, ValueError, StopIteration, duckdb.Error) as exc:
@@ -233,4 +252,49 @@ CREATE TABLE l4_cell_tf_summary AS SELECT logicCellId,slot_in_frame,freqRbStart,
  count(*) FILTER(WHERE has_missing_measurement) AS missing_cnt,avg(has_missing_measurement::INT) AS missing_ratio,
  count(*) FILTER(WHERE has_parse_error) AS parse_error_cnt,min(event_ts) AS start_time,max(event_ts) AS end_time
 FROM l4_ue_resource_ts GROUP BY logicCellId,slot_in_frame,freqRbStart,freqRbNum;
+CREATE TABLE l4_ue_stream_ts AS
+SELECT r.*, s.streamId,
+ list_extract(["instBfSinrGain[0]","instBfSinrGain[1]","instBfSinrGain[2]","instBfSinrGain[3]"],s.streamId+1) AS instBfSinrGain,
+ json_contains(error_reasons,to_json(concat('instBfSinrGain[',s.streamId,']:MISSING_VALUE'))) AS gain_missing,
+ json_contains(error_reasons,to_json(concat('instBfSinrGain[',s.streamId,']:PARSE_ERROR')))
+ OR json_contains(error_reasons,to_json(concat('instBfSinrGain[',s.streamId,']:NON_FINITE'))) AS gain_parse_error
+FROM l4_ue_resource_ts r CROSS JOIN range(4) s(streamId);
+CREATE UNIQUE INDEX stream_record_key ON l4_ue_stream_ts(record_id,streamId);
+CREATE TABLE l4_ue_stream_summary AS
+SELECT logicCellId,ue_uid,resourceId,streamId,count(*) AS sample_cnt,
+ count(instBfSinrGain) AS gain_valid_cnt,avg(instBfSinrGain) AS gain_avg,
+ count(*) FILTER(WHERE gain_missing) AS gain_missing_cnt,
+ count(*) FILTER(WHERE gain_parse_error) AS gain_parse_error_cnt,
+ count(*) FILTER(WHERE is_suspicious) AS suspicious_cnt,avg(is_suspicious::INT) AS suspicious_ratio,
+ min(event_ts) FILTER(WHERE instBfSinrGain IS NOT NULL) AS gain_start_time,
+ max(event_ts) FILTER(WHERE instBfSinrGain IS NOT NULL) AS gain_end_time
+FROM l4_ue_stream_ts WHERE ue_uid IS NOT NULL GROUP BY logicCellId,ue_uid,resourceId,streamId;
+CREATE OR REPLACE TABLE l4_ue_summary AS
+WITH gains AS (
+ SELECT logicCellId,ue_uid,resourceId,
+ list(gain_avg ORDER BY streamId) AS stream_gain_means,
+ list(gain_valid_cnt ORDER BY streamId) AS stream_gain_valid_counts,
+ list(streamId ORDER BY streamId) FILTER(WHERE gain_valid_cnt>0) AS available_streams,
+ count(*) FILTER(WHERE gain_valid_cnt>0) AS available_stream_count,
+ CASE WHEN count(gain_avg)>=2 THEN max(gain_avg)-min(gain_avg) END AS max_stream_gain_diff
+ FROM l4_ue_stream_summary GROUP BY logicCellId,ue_uid,resourceId
+), midpoints AS (
+ SELECT logicCellId,ue_uid,resourceId,min(event_ts)+(max(event_ts)-min(event_ts))/2 AS midpoint
+ FROM l4_ue_resource_ts WHERE ue_uid IS NOT NULL AND usrRsrp IS NOT NULL AND event_ts IS NOT NULL
+ GROUP BY logicCellId,ue_uid,resourceId
+), trends AS (
+ SELECT r.logicCellId,r.ue_uid,r.resourceId,
+ avg(usrRsrp) FILTER(WHERE event_ts>=midpoint)-avg(usrRsrp) FILTER(WHERE event_ts<midpoint) AS rsrp_trend_delta
+ FROM l4_ue_resource_ts r JOIN midpoints m ON r.ue_uid=m.ue_uid AND r.logicCellId=m.logicCellId
+ AND r.resourceId IS NOT DISTINCT FROM m.resourceId GROUP BY r.logicCellId,r.ue_uid,r.resourceId
+), totals AS (
+ SELECT ue_uid,count(DISTINCT record_id) AS ue_total_records FROM l4_ue_resource_ts
+ WHERE ue_uid IS NOT NULL GROUP BY ue_uid
+)
+SELECT u.*,g.stream_gain_means,g.stream_gain_valid_counts,g.available_streams,g.available_stream_count,
+ g.max_stream_gain_diff,t.rsrp_trend_delta,n.ue_total_records
+FROM l4_ue_summary u JOIN gains g ON u.ue_uid=g.ue_uid AND u.logicCellId=g.logicCellId
+ AND u.resourceId IS NOT DISTINCT FROM g.resourceId
+LEFT JOIN trends t ON u.ue_uid=t.ue_uid AND u.logicCellId=t.logicCellId
+ AND u.resourceId IS NOT DISTINCT FROM t.resourceId JOIN totals n ON u.ue_uid=n.ue_uid;
 """

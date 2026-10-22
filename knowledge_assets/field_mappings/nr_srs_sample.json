@@ -1,0 +1,15 @@
+{
+  "revision": "sample-2026-10-22",
+  "aliases": {
+    "uwData": "uwDate",
+    "slot": "slotId",
+    "phyCellInst": "l2PhyCellInst",
+    "freqRbStart": "freqUserRbStart",
+    "freqRbNum": "freqUserRbNum"
+  },
+  "stream_gain_family": "instBfSinrGain",
+  "stream_count": 4,
+  "gain_unit": "dB",
+  "gain_scale": 1.0,
+  "beam_min_array_length": 32
+}

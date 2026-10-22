@@ -97,6 +97,49 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(m["status"], "FAILED")
         self.assertEqual(c.execute("SELECT count(*) FROM l2_standardized").fetchone()[0], 0)
 
+    def test_four_stream_means_and_scalar_denominator(self):
+        gains = [f"instBfSinrGain[{i}]" for i in range(4)]
+        self.write([self.row(rsrp="-50") + [1, 2, 4, 8],
+                    self.row(2, time="00:00:02.000", rsrp="-100") + [1, 2, 4, 8]], extra_header=gains)
+        c, _ = self.build()
+        self.assertEqual(c.execute("SELECT count(*) FROM l4_ue_stream_ts").fetchone()[0], 8)
+        self.assertEqual(c.execute("SELECT sample_cnt,rsrp_avg,max_stream_gain_diff,rsrp_trend_delta,ue_total_records,available_stream_count FROM l4_ue_summary").fetchone(),
+                         (2, -75, 7, -50, 2, 4))
+
+    def test_missing_stream_index_and_nonfinite(self):
+        self.write([self.row() + [1, "inf", 8], self.row(2) + [3, "bad", ""]],
+                   extra_header=["instBfSinrGain[0]", "instBfSinrGain[2]", "instBfSinrGain[3]"])
+        c, _ = self.build()
+        self.assertEqual(c.execute("SELECT streamId,gain_avg,gain_valid_cnt,gain_missing_cnt,gain_parse_error_cnt FROM l4_ue_stream_summary ORDER BY streamId").fetchall(),
+                         [(0, 2, 2, 0, 0), (1, None, 0, 2, 0), (2, None, 0, 0, 2), (3, 8, 1, 1, 0)])
+        self.assertEqual(c.execute("SELECT max_stream_gain_diff,available_streams FROM l4_ue_summary").fetchone(), (6, [0, 3]))
+
+    def test_no_gain_samples_returns_null(self):
+        self.write([self.row()])
+        c, _ = self.build()
+        self.assertEqual(c.execute("SELECT max_stream_gain_diff,available_stream_count FROM l4_ue_summary").fetchone(), (None, 0))
+
+    def test_sample_aliases_duplicate_auxiliary_and_catalog(self):
+        self.contract = json.loads(Path("config/sample_input_contract.json").read_text())
+        path = self.inputs / "NR_SRS.example.csv"
+        header = ["uwTtiCnt1", "logicCellId", "crnti", "uwDate", "uwTime", "slotId", "slot", "tag", "tag", "instBfSinrGain[0]"] + [f"beam[{i}]" for i in range(32)] + ["other[0]"]
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerow([1, 0, 10, "2026/10/11", "10:11:21", 1, "", "a", "b", 40] + [1]*32 + [4])
+        c, _ = self.build()
+        self.assertEqual(c.execute("SELECT slot,year(event_ts) FROM l4_ue_resource_ts").fetchone(), (1, 2026))
+        self.assertEqual(c.execute("SELECT count(*) FROM field_catalog WHERE domain='BEAM_PROVISIONAL'").fetchone()[0], 32)
+        self.assertEqual(c.execute("SELECT domain FROM field_catalog WHERE raw_name='instBfSinrGain[0]'").fetchone()[0], "STREAM")
+        self.assertEqual(c.execute("SELECT count(*) FROM field_catalog WHERE raw_name='tag'").fetchone()[0], 2)
+        self.assertEqual(c.execute("SELECT domain FROM field_catalog WHERE raw_name='other[0]'").fetchone()[0], "UNCONFIRMED_ARRAY")
+
+    def test_duplicate_calculation_field_rejected(self):
+        self.write([self.row() + [20]], extra_header=["crnti"])
+        _, meta = self.build()
+        self.assertEqual(meta["status"], "FAILED")
+        self.assertIn("Ambiguous mapped field", meta["files"][0]["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
