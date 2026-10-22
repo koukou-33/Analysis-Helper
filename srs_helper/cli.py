@@ -34,8 +34,39 @@ def main():
     summary.add_argument("--resource", type=int)
     summary.add_argument("--start", type=datetime.fromisoformat)
     summary.add_argument("--end", type=datetime.fromisoformat)
+    quality = sub.add_parser("quality",help="File/block/field quality report")
+    quality.add_argument("dataset_dir",type=Path)
+    sub.add_parser("sessions",help="List persisted diagnostic sessions")
+    sub.add_parser("knowledge-sync",help="Rebuild/incrementally synchronize knowledge source files")
+    diagnose = sub.add_parser("diagnose",help="Run the persisted LangGraph diagnostic workflow")
+    diagnose.add_argument("dataset_dir",type=Path)
+    diagnose.add_argument("question")
+    diagnose.add_argument("--session-id")
+    diagnose.add_argument("--feature")
+    diagnose.add_argument("--cell",type=int)
+    diagnose.add_argument("--crnti",type=int)
+    diagnose.add_argument("--resource",type=int)
+    diagnose.add_argument("--start",type=datetime.fromisoformat)
+    diagnose.add_argument("--end",type=datetime.fromisoformat)
     args = parser.parse_args()
-    if args.command == "generate":
+    if args.command == "quality":
+        from .database import quality_report
+        print(json.dumps(quality_report(args.dataset_dir),ensure_ascii=False,indent=2,default=str))
+    elif args.command in {"sessions","knowledge-sync","diagnose"}:
+        from .agent import DiagnosticEngine
+        engine = DiagnosticEngine()
+        if args.command=="sessions":
+            result = engine.store.list()
+        elif args.command=="knowledge-sync":
+            result = engine.index.sync()
+        else:
+            sid = args.session_id or engine.store.create(args.dataset_dir,args.question[:80])
+            if Path(engine.store.get(sid)["dataset_dir"]).resolve()!=args.dataset_dir.resolve():
+                raise ValueError("Session belongs to a different dataset directory")
+            result = engine.run(sid,args.question,Scope(logic_cell_id=args.cell,crnti=args.crnti,resource_id=args.resource,start=args.start,end=args.end),feature_path=args.feature)
+            result = {key:result[key] for key in ["session_id","action_id","answer","notices","retrieval_mode","steps"]}
+        print(json.dumps(result,ensure_ascii=False,indent=2,default=str))
+    elif args.command == "generate":
         result = generate(args.template,args.output,args.seed,args.blocks,args.files,args.profile)
         print(json.dumps({"path":str(args.output),"records":len(result["truth"]),"seed":result["seed"],"profile":result["profile"]}))
     elif args.command == "summary":
