@@ -1,4 +1,5 @@
 """Structured plans only: identifiers and operators never come from raw SQL."""
+from .performance import measured
 import json
 import math
 from pathlib import Path
@@ -153,6 +154,7 @@ def plan_fields(plan):
     return fields
 
 
+@measured("schema")
 def scope_columns(con):
     columns = {name: [d[0] for d in con.execute(f'SELECT * EXCLUDE(raw_values) FROM {table} LIMIT 0').description]
                for name,table in [('resource','l4_ue_resource_ts'),('stream','l4_ue_stream_ts')]}
@@ -161,6 +163,7 @@ def scope_columns(con):
     return columns
 
 
+@measured("prepare_scope")
 def prepare_scope(con,scope,required_fields=()):
     where,params = scope.where()
     con.execute(f"CREATE TEMP TABLE resource AS SELECT * EXCLUDE(raw_values) FROM l4_ue_resource_ts WHERE {where}",params)
@@ -180,6 +183,7 @@ def prepare_scope(con,scope,required_fields=()):
     con.execute("CREATE TEMP TABLE stream AS SELECT s.* EXCLUDE(raw_values) FROM l4_ue_stream_ts s JOIN resource r USING(record_id)")
 
 
+@measured("query_plan")
 def execute_plan(directory, scope, plan, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True,exist_ok=True)

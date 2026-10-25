@@ -1,4 +1,5 @@
 """LangGraph diagnosis with persisted checkpoints and evidence-first output."""
+from .performance import measured
 import json
 import sqlite3
 from datetime import datetime
@@ -54,6 +55,7 @@ class DiagnosticEngine:
         embedding_config = ServiceConfig.from_env("EMBEDDING")
         self.embedder = embedder or (ModelService(embedding_config) if embedding_config.configured else None)
 
+    @measured("diagnosis")
     def run(self,sid,question,scope=None,action_id=None,retry=False,feature_path=None,progress=None,plan_override=None,sql_override=None):
         scope,action_id = scope or Scope(),action_id or str(uuid4())
         scope.where()
@@ -226,7 +228,7 @@ class DiagnosticEngine:
         nodes = [("retrieve",retrieve),("plan",plan_node),("execute",execute),("verify",verify),("explain",explain)]
         previous = START
         for name,node in nodes:
-            graph.add_node(name,node)
+            graph.add_node(name,measured("agent_"+name)(node))
             graph.add_edge(previous,name)
             previous = name
         graph.add_edge(previous,END)

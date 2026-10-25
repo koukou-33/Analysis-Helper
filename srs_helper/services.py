@@ -1,4 +1,5 @@
 """Explicitly configured OpenAI-compatible HTTP adapters; no preset model/key."""
+from .performance import measured
 import base64
 import json
 import math
@@ -77,6 +78,7 @@ class ModelService:
                     raise ServiceError("模型请求超时、连接失败或返回格式无效，已保留数据与结果。") from None
         raise ServiceError("模型服务未完成请求。")
 
+    @measured("model_chat")
     def chat_json(self, messages, images=()):
         payload = [{"role":m.type.replace("human","user").replace("ai","assistant"),"content":m.content} for m in messages]
         if images:
@@ -100,6 +102,7 @@ class ModelService:
         except (KeyError,IndexError,TypeError,ValueError):
             raise ServiceError("模型返回的结构化输出无效。") from None
 
+    @measured("model_embedding")
     def embed(self,texts):
         result = self._post("/embeddings",{"model":self.config.model,"input":texts})
         try:

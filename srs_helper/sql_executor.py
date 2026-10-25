@@ -1,4 +1,5 @@
 """Restricted exploratory SQL. It cannot establish automatic feature conclusions."""
+from .performance import measured
 from pathlib import Path
 
 import sqlglot
@@ -48,6 +49,7 @@ def validate_sql(sql):
     return tree.sql(dialect="duckdb")
 
 
+@measured("manual_sql")
 def execute_sql(directory,scope,sql,parameters,output_dir):
     validated = validate_sql(sql)
     if not isinstance(parameters,list) or len(parameters)>100 or any(not isinstance(p,(str,int,float,bool,type(None))) for p in parameters):

@@ -150,6 +150,7 @@ CSV 读取器逐文件、按原始记录顺序解析，并在任何排序、过�
 - 手工 SQL 从已校验的 AST 提取字段；`COUNT(*)` 不触发全字段展开，显式 `SELECT *` 仍表示全列输出，大范围全列查询应缩小范围或改为指定列。
 - 保留 512 MB、2 线程及 30 秒连接操作预算，不以延长超时替代优化。已有 m1.3 数据集可直接使用新的查询路径，无需为性能修复重建数据。
 - 440 字段、34,000,120 行合成补充数据的基准与复现方法见 `docs/ISSUES.md`。该基准验证准备阶段，不代表现场全链路延迟。
+- 性能观测：加载、基础统计、范围准备、查询、模型调用和完整诊断的耗时及进程驻留内存写入独立 UTF-8 文本 `workspace_storage/logs/performance.txt`（每行 JSON）。阶段以 trace_id 关联，记录成功或异常类型；不写密钥、提示词、SQL 或原始业务记录。每 100 ms 采样的最大值为整个进程的采样峰值，不等同于单查询独占峰值。导入时累计补充行数，不新增全表扫描。日志故障不影响业务结果。字段和归档方式见 `docs/PERFORMANCE_LOG.md`。
 - `required_identity_columns`：`uwTtiCnt1, logicCellId, crnti, uwData, uwTime`；
 - `flow_presence_column`：固定为 `crnti`，只检查原始值是否缺失；
 - `nullable_measurement_columns`：允许合法缺测的测量列；

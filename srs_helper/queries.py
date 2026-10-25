@@ -1,4 +1,5 @@
 """Parameterized descriptive queries over a single persisted dataset."""
+from .performance import measured
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -35,6 +36,7 @@ class Scope:
         return " AND ".join(conditions) or "true", parameters
 
 
+@measured("summary")
 def summarize(dataset_dir, scope=None, dataset_id=None):
     scope = scope or Scope()
     where, parameters = scope.where()

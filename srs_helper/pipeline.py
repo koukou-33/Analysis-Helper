@@ -1,4 +1,5 @@
 """Snapshot CSV input and publish an isolated, immutable DuckDB dataset."""
+from .performance import measured
 import csv
 import hashlib
 import json
@@ -92,6 +93,7 @@ def normalize(row, header, contract, source, file_hash, row_id, dataset_id, posi
             raw.get("uwData"), raw.get("uwTime"), event_ts, *values)
 
 
+@measured("load_dataset")
 def build_dataset(input_dir, storage, contract):
     contract = dict(contract)
     if "field_mapping_file" in contract:
@@ -178,6 +180,7 @@ def build_dataset(input_dir, storage, contract):
                     entry["columns"] = header
                     batch = []
                     extra_batch = []
+                    supplemental_rows = 0
                     for row_id, row in enumerate(reader, 1):
                         for idx, value in enumerate(row[:len(header)]):
                             present[idx] += value.strip() not in contract["null_values"]
@@ -195,18 +198,21 @@ def build_dataset(input_dir, storage, contract):
                         if len(batch) == 2000:
                             insert_batch(con, "l2_standardized", batch)
                             insert_batch(con, "l2_extra_numeric", extra_batch)
+                            supplemental_rows += len(extra_batch)
                             batch.clear()
                             extra_batch.clear()
                     if batch:
                         insert_batch(con, "l2_standardized", batch)
                         insert_batch(con, "l2_extra_numeric", extra_batch)
+                        supplemental_rows += len(extra_batch)
                     insert_batch(con, "field_catalog", [
                         (entry["source_file"], *col, present[col[0]], row_id-present[col[0]],
                          "NO_RECORDS" if row_id == 0 else "ALL_NULL" if present[col[0]] == 0 else
                          "AVAILABLE" if present[col[0]] == row_id else "PARTIAL_MISSING") for col in catalog])
                     entry["unavailable_mapped_fields"] = sorted(set(NUMBERS) - positions.keys())
                 con.execute("COMMIT")
-                entry.update(status="LOADED", records=row_id)
+                entry.update(status="LOADED", records=row_id, supplemental_numeric_rows=supplemental_rows,
+                             supplemental_field_count=len(extras))
             except (OSError, UnicodeError, csv.Error, ValueError, StopIteration, duckdb.Error) as exc:
                 con.execute("ROLLBACK")
                 entry.update(status="FAILED", error=str(exc), record_near=row_id + 1)

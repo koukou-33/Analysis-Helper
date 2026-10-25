@@ -1,4 +1,5 @@
 """Dataset validation and resource-bounded read connections."""
+from .performance import measured
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -28,6 +29,7 @@ def open_dataset(directory, seconds=30):
         con.close()
 
 
+@measured("quality_report")
 def quality_report(directory):
     with open_dataset(directory) as (con, meta):
         def rows(sql):
