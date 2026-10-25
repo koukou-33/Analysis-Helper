@@ -16,7 +16,7 @@
 python -m srs_helper.cli load docs/NR_SRS_temp.csv --contract config/sample_input_contract.json
 ```
 
-支持显式 CSV 路径以读取此样例文件名。目录输入仍只扫描 `NR_SRS.*.csv`，避免误读其他 CSV。
+支持显式 CSV 路径以读取此样例文件名。2026-10-25 起目录扫描支持生产下划线文件名与括号副本编号，并兼容 `NR_SRS.*.csv`；日期契约已统一为 `%Y-%m-%d`。本页其余内容保留最初样例验证记录。
 
 模拟回归另行覆盖：四流均值 1/2/4/8 差为 7；缺流不前移；非有限/非法值与真实缺测区分；标量样本数不乘四；临时波束域与其他数组分离；映射目标重名拒绝加载。
 

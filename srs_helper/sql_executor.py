@@ -55,7 +55,11 @@ def execute_sql(directory,scope,sql,parameters,output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True,exist_ok=True)
     with open_dataset(directory) as (con,meta):
-        prepare_scope(con,scope)
+        tree = sqlglot.parse_one(validated,read="duckdb")
+        # A star explicitly requests all columns; COUNT(*) does not.
+        all_fields = any(not isinstance(star.parent,exp.Count) for star in tree.find_all(exp.Star))
+        fields = None if all_fields else {column.name for column in tree.find_all(exp.Column)}
+        prepare_scope(con,scope,fields)
         con.execute("EXPLAIN "+validated,parameters)
         con.execute("CREATE TEMP TABLE manual_result AS "+validated,parameters)
         plan = default_plan(meta,"Manual exploratory SQL")

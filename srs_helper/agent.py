@@ -13,7 +13,7 @@ from langgraph.graph import END, START, StateGraph
 from .database import open_dataset, quality_report
 from .evidence import feature_analysis, validate_numeric_claim, verify_artifact
 from .knowledge import KnowledgeIndex
-from .plans import QueryPlan, default_plan, execute_plan, prepare_scope
+from .plans import QueryPlan, default_plan, execute_plan, scope_columns
 from .queries import Scope, summarize
 from .services import ModelService, ServiceConfig, ServiceError, extract_feature
 from .sessions import SessionStore, dumps
@@ -75,8 +75,7 @@ class DiagnosticEngine:
         with open_dataset(session["dataset_dir"]) as (con,meta):
             if (meta["dataset_id"],meta["dataset_fingerprint"]) != (session["dataset_id"],session["fingerprint"]):
                 raise ValueError("Session dataset version no longer matches")
-            prepare_scope(con,scope)
-            columns = {name:[d[0] for d in con.execute(f'SELECT * FROM "{name}" LIMIT 0').description] for name in ("resource","stream")}
+            columns = scope_columns(con)
         folder = self.store.directory(sid)/"artifacts"
         ephemeral = {}  # full results live in files, not LangGraph checkpoints
         def announce(name):

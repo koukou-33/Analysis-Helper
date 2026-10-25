@@ -46,6 +46,7 @@ def feature_analysis(directory, scope, meta, feature, output_dir):
     if not feature.conditions:
         return {"status":"INSUFFICIENT","reason":"文档未定义条件","artifacts":[]}
     plan = QueryPlan(dataset_id=meta["dataset_id"],dataset_fingerprint=meta["dataset_fingerprint"],question=feature.title,
+                     required_fields=[feature.flag_field] if feature.flag_field else [],
                      steps=[Step(step_id="s1",operator="CONDITION_COUNT",conditions={c.condition_id:Expression.model_validate(c.expression) for c in feature.conditions})])
     artifacts = execute_plan(directory,scope,plan,output_dir)
     rows_path = artifacts[0]["path"]

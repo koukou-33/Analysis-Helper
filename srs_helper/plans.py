@@ -57,6 +57,7 @@ class QueryPlan(BaseModel):
     steps: list[Step] = Field(min_length=1, max_length=8)
     document_refs: list[dict] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
+    required_fields: list[str] = Field(default_factory=list, max_length=512)
 
     @model_validator(mode="after")
     def dependencies(self):
@@ -113,17 +114,68 @@ def default_plan(meta, question):
                          Metric(field="instBfSinrGain",aggregate="count",output="gain_valid_cnt")])])
 
 
-def prepare_scope(con,scope):
+def supplemental_columns(con):
+    """Read the small header catalog, never DISTINCT over measurement rows."""
+    from collections import Counter
+    from .pipeline import NUMBERS
+    from .schema import bindings
+    meta = json.loads(con.execute('SELECT metadata FROM _etl_meta').fetchone()[0])
+    if meta['rule_version'] == 'm1.2':
+        return []
+    names = set()
+    for entry in meta['files']:
+        if entry['status'] != 'LOADED':
+            continue
+        header = entry['columns']
+        mapped = set(bindings(header, meta['contract'], NUMBERS).values())
+        counts = Counter(n.casefold() for n in header)
+        reserved = {n.casefold() for n in NUMBERS} | {'uwdata','uwdate','uwtime','record_id','source_file','event_ts','ue_uid','streamid'}
+        names.update(n for i,n in enumerate(header) if i not in mapped and counts[n.casefold()]==1
+                     and n.casefold() not in reserved and '[' not in n and n and len(n)<=100)
+    return sorted(names)
+
+
+def plan_fields(plan):
+    fields = set(plan.required_fields)
+    def visit(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in {'field','compare_field'} and isinstance(item,str):
+                    fields.add(item)
+                elif key in {'group_by','object_keys'}:
+                    fields.update(item)
+                else:
+                    visit(item)
+        elif isinstance(value,list):
+            for item in value:
+                visit(item)
+    visit(plan.model_dump())
+    return fields
+
+
+def scope_columns(con):
+    columns = {name: [d[0] for d in con.execute(f'SELECT * EXCLUDE(raw_values) FROM {table} LIMIT 0').description]
+               for name,table in [('resource','l4_ue_resource_ts'),('stream','l4_ue_stream_ts')]}
+    existing = {n.casefold() for n in columns['resource']}
+    columns['resource'].extend(n for n in supplemental_columns(con) if n.casefold() not in existing)
+    return columns
+
+
+def prepare_scope(con,scope,required_fields=()):
     where,params = scope.where()
     con.execute(f"CREATE TEMP TABLE resource AS SELECT * EXCLUDE(raw_values) FROM l4_ue_resource_ts WHERE {where}",params)
     existing = {d[0].casefold() for d in con.execute("SELECT * FROM resource LIMIT 0").description}
-    if con.execute("SELECT count(*) FROM information_schema.tables WHERE table_name='l2_extra_numeric'").fetchone()[0]:
-        names = [r[0] for r in con.execute("SELECT DISTINCT field_name FROM l2_extra_numeric ORDER BY field_name").fetchall() if r[0].casefold() not in existing]
+    if required_fields is None or required_fields:
+        names = [n for n in supplemental_columns(con) if n.casefold() not in existing
+                 and (required_fields is None or n.casefold() in {f.casefold() for f in required_fields})]
         if len(names)>512:
             raise ValueError("More than 512 supplemental fields; select an explicit version mapping")
         if names:
             expressions = ','.join('max(value) FILTER(WHERE field_name=?) AS '+identifier(n,names) for n in names)
-            con.execute('CREATE TEMP TABLE extra_values AS SELECT record_id,'+expressions+' FROM l2_extra_numeric GROUP BY record_id',names)
+            placeholders = ','.join('?' for _ in names)
+            con.execute('CREATE TEMP TABLE extra_values AS SELECT record_id,'+expressions+
+                        ' FROM (SELECT e.record_id,e.field_name,e.value FROM l2_extra_numeric e '
+                        'SEMI JOIN resource r USING(record_id) WHERE field_name IN ('+placeholders+')) GROUP BY record_id',names+names)
             con.execute('CREATE OR REPLACE TEMP TABLE resource AS SELECT r.*,e.* EXCLUDE(record_id) FROM resource r LEFT JOIN extra_values e USING(record_id)')
     con.execute("CREATE TEMP TABLE stream AS SELECT s.* EXCLUDE(raw_values) FROM l4_ue_stream_ts s JOIN resource r USING(record_id)")
 
@@ -135,7 +187,7 @@ def execute_plan(directory, scope, plan, output_dir):
     with open_dataset(directory) as (con,meta):
         if (plan.dataset_id,plan.dataset_fingerprint) != (meta["dataset_id"],meta["dataset_fingerprint"]):
             raise ValueError("Plan belongs to another dataset version")
-        prepare_scope(con,scope)
+        prepare_scope(con,scope,plan_fields(plan))
         for step in plan.steps:
             source = step.source  # validated relation IDs only
             columns = {d[0] for d in con.execute(f'SELECT * FROM "{source}" LIMIT 0').description}

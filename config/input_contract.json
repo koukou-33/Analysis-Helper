@@ -1,7 +1,7 @@
 {
   "encoding": "utf-8-sig",
   "delimiter": ",",
-  "date_format": "%Y%m%d",
+  "date_format": "%Y-%m-%d",
   "time_format": "%H:%M:%S.%f",
   "null_values": ["", "NULL", "null", "N/A"],
   "required_identity_columns": ["uwTtiCnt1", "logicCellId", "crnti", "uwData", "uwTime"],

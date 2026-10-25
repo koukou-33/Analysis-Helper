@@ -27,7 +27,7 @@ class PipelineTests(unittest.TestCase):
             writer.writerows(rows)
         return path
 
-    def row(self, tti=1, crnti="10", time="00:00:00.000", rsrp="-100", ni="-110", date="20261021"):
+    def row(self, tti=1, crnti="10", time="00:00:00.000", rsrp="-100", ni="-110", date="2026-10-21"):
         return [tti, 1, crnti, date, time, rsrp, ni]
 
     def build(self):
@@ -35,6 +35,19 @@ class PipelineTests(unittest.TestCase):
         con = duckdb.connect(str(path / "analysis.duckdb"), read_only=True)
         self.addCleanup(con.close)
         return con, meta
+
+    def test_production_capture_names_and_dates(self):
+        from srs_helper.pipeline import is_capture_name
+        for name in ['NR_SRS_10-25_12-30-45.csv', 'NR_SRS(1)_10-25_12-30-45.csv']:
+            self.assertTrue(is_capture_name(name))
+        for name in ['NR_SRS_temp.csv','NR_SRS_10-25.csv','XNR_SRS_10-25_12-30-45.csv','NR_SRS_10-25_12-30-45.csv.bak']:
+            self.assertFalse(is_capture_name(name))
+        self.write([self.row()], 'NR_SRS_10-25_12-30-45.csv')
+        self.write([self.row(2,date='2026-02-30')], 'NR_SRS(1)_10-25_12-30-45.csv')
+        self.write([self.row(3)], 'NR_SRS_temp.csv')
+        con,meta = self.build()
+        self.assertEqual(len(meta['files']),2)
+        self.assertEqual(con.execute('SELECT count(*),count(event_ts) FROM l2_standardized').fetchone(),(2,1))
 
     def test_complete_and_repeated_blocks(self):
         self.write([self.row(10), self.row(10), self.row(11), self.row(10)])
@@ -83,7 +96,7 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(c.execute("SELECT csv_structure_complete FROM l4_ue_resource_ts WHERE file_row_id=2").fetchone()[0])
 
     def test_cross_midnight_and_restore_without_source(self):
-        self.write([self.row(time="00:00:01.000", date="20261022"), self.row(time="23:59:59.000")])
+        self.write([self.row(time="00:00:01.000", date="2026-10-22"), self.row(time="23:59:59.000")])
         c, _ = self.build()
         self.assertEqual(c.execute("SELECT max(time_sec) FROM l4_ue_resource_ts").fetchone()[0], 2)
         for path in self.inputs.iterdir():
@@ -127,7 +140,7 @@ class PipelineTests(unittest.TestCase):
         with path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(header)
-            writer.writerow([1, 0, 10, "2026/10/11", "10:11:21", 1, "", "a", "b", 40] + [1]*32 + [4])
+            writer.writerow([1, 0, 10, "2026-10-11", "10:11:21", 1, "", "a", "b", 40] + [1]*32 + [4])
         c, _ = self.build()
         self.assertEqual(c.execute("SELECT slot,year(event_ts) FROM l4_ue_resource_ts").fetchone(), (1, 2026))
         self.assertEqual(c.execute("SELECT count(*) FROM field_catalog WHERE domain='BEAM_PROVISIONAL'").fetchone()[0], 32)

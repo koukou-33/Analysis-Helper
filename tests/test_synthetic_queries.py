@@ -65,7 +65,7 @@ class SyntheticQueryTests(unittest.TestCase):
         for path in self.normal.glob("*.csv"):
             with path.open(newline="") as stream:
                 for r in csv.DictReader(stream):
-                    ts = datetime.strptime(r["uwDate"]+" "+r["uwTime"], "%Y/%m/%d %H:%M:%S")
+                    ts = datetime.strptime(r["uwDate"]+" "+r["uwTime"], "%Y-%m-%d %H:%M:%S")
                     if int(r["logicCellId"]) == 0 and int(r["crnti"]) == 1000 and int(r["resourceId"]) == 0 and start <= ts < end:
                         selected.append(r)
         self.assertEqual(result["flow_valid_count"], len(selected))

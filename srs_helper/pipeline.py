@@ -3,6 +3,7 @@ import csv
 import hashlib
 import json
 import math
+import re
 import shutil
 import uuid
 from collections import Counter
@@ -14,6 +15,13 @@ import pyarrow as pa
 from .schema import bindings, column_catalog
 
 RULE_VERSION = "m1.3"
+CAPTURE_NAME = re.compile(r"NR_SRS(?:\(\d+\))?_\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.csv", re.IGNORECASE)
+LEGACY_CAPTURE_NAME = re.compile(r"NR_SRS\..+\.csv", re.IGNORECASE)
+
+def is_capture_name(name):
+    return bool(CAPTURE_NAME.fullmatch(name) or LEGACY_CAPTURE_NAME.fullmatch(name))
+
+
 GAIN_FIELDS = tuple(f"instBfSinrGain[{i}]" for i in range(4))
 NUMBERS = ("uwTtiCnt1", "logicCellId", "crnti", "phyCellInst", "resourceId",
            "frmNum", "subFrmNum", "slot", "freqRbStart", "freqRbNum", "usrRsrp", "srsUeNiDb") + GAIN_FIELDS
@@ -94,11 +102,11 @@ def build_dataset(input_dir, storage, contract):
     if contract["flow_presence_column"] != "crnti":
         raise ValueError("Flow presence must use raw crnti")
     root, storage = Path(input_dir).resolve(), Path(storage).resolve()
-    paths = [root] if root.is_file() and root.suffix.lower() == ".csv" else sorted(root.rglob("NR_SRS.*.csv"))
+    paths = [root] if root.is_file() and root.suffix.lower() == ".csv" else sorted(p for p in root.rglob("*") if p.is_file() and is_capture_name(p.name))
     if root.is_file():
         root = root.parent
     if not paths:
-        raise ValueError("No NR_SRS.*.csv files found")
+        raise ValueError("No matching NR_SRS capture CSV files found")
     dataset_id = str(uuid.uuid4())
     build = storage / (".building-" + dataset_id)
     build.mkdir(parents=True)

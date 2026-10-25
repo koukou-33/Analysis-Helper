@@ -15,7 +15,7 @@ python -m venv .venv
 .venv\Scripts\python -m unittest discover -s tests -v
 ```
 
-示例输入选用 `config/sample_input_contract.json`，通过 `knowledge_assets/field_mappings/nr_srs_sample.json` 映射 `uwDate`、`slotId` 等列。标准列名输入使用 `config/input_contract.json`。目录递归查找 `NR_SRS.*.csv`，也可显式加载单个 CSV。严格保留原始记录、重复列位置和错误原因，每批最多 2000 行，通过 Arrow 写入 DuckDB。
+示例输入选用 `config/sample_input_contract.json`，通过 `knowledge_assets/field_mappings/nr_srs_sample.json` 映射 `uwDate`、`slotId` 等列。标准列名输入使用 `config/input_contract.json`。日期默认 `%Y-%m-%d`。目录递归查找 `NR_SRS_XX-XX_XX-XX-XX.csv`、`NR_SRS(1)_XX-XX_XX-XX-XX.csv`，兼容旧 `NR_SRS.*.csv`，也可显式加载单个 CSV。严格保留原始记录、重复列位置和错误原因，每批最多 2000 行，通过 Arrow 写入 DuckDB。现场修复与复验步骤见 [问题台账](docs/ISSUES.md)。
 
 输出包括固定快照、清单、DuckDB 中的 L2/L3、隔离行、资源与四流明细、UE/小区时频汇总。失败文件回滚，重复文件只计算一次。每次加载发布独立目录；历史会话绑定固定数据版本，恢复不重读源 CSV。
 

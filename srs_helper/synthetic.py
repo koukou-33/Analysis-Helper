@@ -46,7 +46,7 @@ def generate(template, output, seed=20261022, blocks=50, files=2, profile="norma
                     for _ in range(3):
                         gains.append(round(gains[-1] - rng.uniform(1, 3), 3))
                     values = dict(uwTtiCnt1=block, logicCellId=idx % 2, crnti=1000+idx,
-                                  uwDate=timestamp.strftime("%Y/%m/%d"), uwTime=timestamp.strftime("%H:%M:%S"),
+                                  uwDate=timestamp.strftime("%Y-%m-%d"), uwTime=timestamp.strftime("%H:%M:%S"),
                                   slotId=idx % 2, l2PhyCellInst=70+idx % 2, freqUserRbStart=(block % 2)*24,
                                   freqUserRbNum=24, resourceId=block % 2, frmNum=(number//20) % 1024,
                                   subFrmNum=number % 10, usrRsrp=round(rng.uniform(-115, -85), 3),
