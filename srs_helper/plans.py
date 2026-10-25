@@ -46,6 +46,33 @@ class Step(BaseModel):
     start: str | None = None
     end: str | None = None
 
+    @model_validator(mode="after")
+    def operator_contract(self):
+        if self.operator == 'FILTER' and self.condition is None:
+            raise ValueError('FILTER requires condition')
+        if self.operator == 'CONDITION_COUNT':
+            if not 1 <= len(self.conditions) <= 20:
+                raise ValueError('CONDITION_COUNT requires 1-20 entries in conditions, e.g. c1; condition and metrics are not substitutes')
+            import re
+            if any(not re.fullmatch(r'c[0-9]{1,3}', key) for key in self.conditions):
+                raise ValueError('CONDITION_COUNT keys must be c0..c999')
+            if self.condition is not None or self.metrics:
+                raise ValueError('CONDITION_COUNT uses conditions only; remove condition and metrics')
+        if self.operator == 'GROUP_AGG':
+            outputs = [m.output for m in self.metrics]
+            if not outputs or len(set(outputs)) != len(outputs) or set(outputs) & set(self.group_by+['sample_cnt']):
+                raise ValueError('GROUP_AGG needs metrics with unique outputs, excluding group keys and sample_cnt')
+        if self.operator == 'COMPARE' and not self.compare_field:
+            raise ValueError('COMPARE requires compare_field')
+        if self.operator == 'TIME_SLICE':
+            from datetime import datetime
+            if not self.start or not self.end:
+                raise ValueError('TIME_SLICE requires start and end')
+            Scope(start=datetime.fromisoformat(self.start),end=datetime.fromisoformat(self.end)).where()
+        if self.operator == 'TEMPORAL_RELATE' and (not self.other_source or not self.object_keys or self.window_seconds is None):
+            raise ValueError('TEMPORAL_RELATE requires other_source, object_keys and window_seconds')
+        return self
+
 
 class QueryPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")

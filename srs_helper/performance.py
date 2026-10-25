@@ -50,6 +50,12 @@ def write_record(record):
         warnings.warn('Performance log could not be written.', RuntimeWarning, stacklevel=2)
 
 
+def validation_event(stage, attempt, details):
+    write_record({'timestamp_utc':datetime.now(timezone.utc).isoformat(),
+                  'trace_id':_trace.get(), 'stage':stage, 'attempt':attempt,
+                  'status':'REJECTED', 'diagnostics':details})
+
+
 def measured(stage):
     def decorate(function):
         @wraps(function)

@@ -28,3 +28,5 @@
 使用文件锁串行追加，支持多线程/多进程。写入失败时发出不含敏感信息的警告，保留业务结果。日志持续追加，长期运行可在停服后归档文件；后续操作自动重建。
 
 加载真实数据后分别运行基础统计、单字段及多字段分析，按 `trace_id` 筛选日志，比较各阶段耗时、请求字段数、输出行数和内存。模型与数据库耗时分开查看，不累加嵌套阶段。
+
+校验拒绝额外写入 `plan_validation` / `explanation_validation` 事件（status=REJECTED），包含 attempt 和 diagnostics。解释 diagnostics 为 code 与 location，例如 UNIT_MISMATCH、claims[0].unit。事件不含耗时与内存字段；同一动作的结果 JSON 也保存 validation_errors，可在会话恢复时查看。旧请求无法补写当时未保存的失败原因。

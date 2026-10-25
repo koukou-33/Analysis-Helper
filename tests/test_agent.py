@@ -69,6 +69,31 @@ class AgentTests(unittest.TestCase):
         model = ModelService(ServiceConfig("local_openai","http://localhost/v1","test"),httpx.MockTransport(success))
         self.assertEqual(model.chat_json([HumanMessage(content="hello")]),{"ok":True})
 
+    def test_plan_feedback_and_explanation_diagnostics_persist(self):
+        from srs_helper.plans import default_plan
+        parent = self
+        class RepairModel:
+            config = ServiceConfig(provider='local_openai',base_url='http://example',model='test')
+            calls = 0
+            def chat_json(self,messages):
+                self.calls += 1
+                if self.calls == 1:
+                    plan = default_plan(parent.normal_meta,'test').model_dump(mode='json')
+                    plan['steps'] = [{'step_id':'s1','operator':'CONDITION_COUNT','condition':{'op':'eq','field':'gain_missing','value':True}}]
+                    return plan
+                if self.calls == 2:
+                    parent.assertIn('CONDITION_COUNT',messages[-1].content)
+                    return default_plan(parent.normal_meta,'test').model_dump(mode='json')
+                return {'claims':[],'hypotheses':[{'text':'guess','references':['not_known']}]}
+        engine = DiagnosticEngine(self.root/'agent_diagnostics',self.root/'empty_assets',model=RepairModel())
+        sid = engine.store.create(self.normal_db)
+        result = engine.run(sid,'test')
+        self.assertEqual(len(result['validation_errors']),4)
+        self.assertEqual(result['validation_errors'][-1]['code'],'UNBOUND_HYPOTHESIS')
+        self.assertEqual(result['validation_errors'][-1]['location'],'hypotheses[0].references')
+        self.assertTrue(any('UNBOUND_HYPOTHESIS' in n for n in result['notices']))
+        self.assertEqual(engine.store.history(sid)[0]['validation_errors'],result['validation_errors'])
+
     def test_embedding_response_contract(self):
         model = ModelService(ServiceConfig("local_openai","http://localhost/v1","test"),httpx.MockTransport(
             lambda r:httpx.Response(200,json={"data":[{"index":0,"embedding":[1,2]},{"index":1,"embedding":[1]}]})))
