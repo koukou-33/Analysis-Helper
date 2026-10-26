@@ -23,8 +23,8 @@ class PipelineTests(unittest.TestCase):
         path = self.inputs / name
         with path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["uwTtiCnt1", "logicCellId", "crnti", "uwData", "uwTime", "usrRsrp", "srsUeNiDb", *extra_header])
-            writer.writerows(rows)
+            writer.writerow(["ueLayerNum", "uwTtiCnt1", "logicCellId", "crnti", "uwData", "uwTime", "usrRsrp", "srsUeNiDb", *extra_header])
+            writer.writerows([[4, *row] for row in rows])
         return path
 
     def row(self, tti=1, crnti="10", time="00:00:00.000", rsrp="-100", ni="-110", date="2026-10-21"):
@@ -63,8 +63,8 @@ class PipelineTests(unittest.TestCase):
     def test_parse_presence_quality_and_finite_mean(self):
         self.write([self.row(crnti="bad", rsrp="-50", ni=""), self.row(2, rsrp="nan"), self.row(3)])
         c, _ = self.build()
-        self.assertEqual(c.execute("SELECT count(*),avg(usrRsrp) FROM l4_ue_resource_ts").fetchone(), (3, -75))
-        self.assertEqual(c.execute("SELECT crnti_present,is_suspicious,has_missing_measurement,data_quality_tag,ue_uid FROM l4_ue_resource_ts WHERE file_row_id=1").fetchone(), (True, True, True, "PARSE_ERROR", None))
+        self.assertEqual(c.execute("SELECT count(*),avg(usrRsrp) FROM l4_ue_resource_ts").fetchone(), (2, -100))
+        self.assertEqual(c.execute("SELECT crnti_present,is_suspicious,has_missing_measurement,data_quality_tag,ue_uid FROM l3_cleaned_srs LEFT JOIN assigned_sessions USING(record_id) WHERE file_row_id=1").fetchone(), (True, True, True, "PARSE_ERROR", None))
         self.assertEqual(c.execute("SELECT rsrp_missing,has_parse_error FROM l4_ue_resource_ts WHERE file_row_id=2").fetchone(), (False, True))
 
     def test_session_gap_threshold(self):
@@ -116,9 +116,9 @@ class PipelineTests(unittest.TestCase):
         self.write([self.row(rsrp="-50") + [1, 2, 4, 8],
                     self.row(2, time="00:00:02.000", rsrp="-100") + [1, 2, 4, 8]], extra_header=gains)
         c, _ = self.build()
-        self.assertEqual(c.execute("SELECT count(*) FROM l4_ue_stream_ts").fetchone()[0], 8)
+        self.assertEqual(c.execute("SELECT count(*) FROM l4_ue_stream_ts").fetchone()[0], 4)
         self.assertEqual(c.execute("SELECT sample_cnt,rsrp_avg,max_stream_gain_diff,rsrp_trend_delta,ue_total_records,available_stream_count FROM l4_ue_summary").fetchone(),
-                         (2, -75, 7, -50, 2, 4))
+                         (1, -100, 7, None, 1, 4))
 
     def test_missing_stream_index_and_nonfinite(self):
         self.write([self.row() + [1, "inf", 8], self.row(2) + [3, "bad", ""]],
@@ -139,8 +139,8 @@ class PipelineTests(unittest.TestCase):
         header = ["uwTtiCnt1", "logicCellId", "crnti", "uwDate", "uwTime", "slotId", "slot", "tag", "tag", "instBfSinrGain[0]"] + [f"beam[{i}]" for i in range(32)] + ["other[0]"]
         with path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(header)
-            writer.writerow([1, 0, 10, "2026-10-11", "10:11:21", 1, "", "a", "b", 40] + [1]*32 + [4])
+            writer.writerow(["ueLayerNum", *header])
+            writer.writerow([4, 1, 0, 10, "2026-10-11", "10:11:21", 1, "", "a", "b", 40] + [1]*32 + [4])
         c, _ = self.build()
         self.assertEqual(c.execute("SELECT slot,year(event_ts) FROM l4_ue_resource_ts").fetchone(), (1, 2026))
         self.assertEqual(c.execute("SELECT count(*) FROM field_catalog WHERE domain='BEAM_PROVISIONAL'").fetchone()[0], 32)

@@ -26,6 +26,10 @@ class FieldMeta(BaseModel):
     name: str
     description: str
     unit: str | None = None
+    responsibility_layer: Literal["L1内部", "L1测量", "L2", "L3"] | None = None
+    source_version: str | None = None
+    source_line: int | None = None
+    diagnostic_hint: str | None = None
     domain: Literal["SCALAR", "STREAM", "BEAM_PROVISIONAL", "UNCONFIRMED_ARRAY"] = "SCALAR"
 
 
@@ -104,6 +108,9 @@ def parse_document(path, kind="case"):
             metadata = {"feature_id":path.stem,"title":path.stem,"unstructured":True}
         else:
             metadata = FeatureSpec.model_validate(metadata).model_dump(mode="json")
+    elif kind == "field":
+        from .field_metadata import compile_mapping
+        metadata["field_catalog"] = compile_mapping(path)
     images, warnings = [], []
     for caption, relative in re.findall(r"!\[([^\]]*)\]\(([^)]+)\)", body):
         asset = safe_asset(path.parent, relative)  # unsafe paths reject the document
@@ -193,6 +200,8 @@ class KnowledgeIndex:
 
     def search(self, question, limit=3, embedder=None):
         docs = self.documents()
+        from .field_metadata import field_chunks
+        docs = [chunk for doc in docs for chunk in (field_chunks(doc) if doc['kind']=='field' else [doc])]
         if not docs:
             return [], "无可用知识源"
         corpus = [tokens(json.dumps(d["metadata"], ensure_ascii=False)+d["body"]+json.dumps(d["images"],ensure_ascii=False)) or ["_"] for d in docs]

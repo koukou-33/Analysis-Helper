@@ -2,6 +2,7 @@
 from .performance import measured
 import base64
 import json
+import re
 import math
 import os
 import time
@@ -14,6 +15,18 @@ from dotenv import load_dotenv
 
 class ServiceError(RuntimeError):
     pass
+
+
+def parse_json_object(content):
+    if not isinstance(content, str):
+        raise ValueError("Expected JSON text")
+    wrapped = re.fullmatch(r"\s*```(?:json)?\s*\n([\s\S]*?)\n```\s*", content, re.IGNORECASE)
+    if wrapped:
+        content = wrapped[1]
+    result = json.loads(content)
+    if not isinstance(result, dict):
+        raise ValueError("Expected JSON object")
+    return result
 
 
 @dataclass
@@ -95,7 +108,7 @@ class ModelService:
             payload[-1]["content"] = parts
         result = self._post("/chat/completions",{"model":self.config.model,"messages":payload,"response_format":{"type":"json_object"}})
         try:
-            content = json.loads(result["choices"][0]["message"]["content"])
+            content = parse_json_object(result["choices"][0]["message"]["content"])
             if not isinstance(content,dict):
                 raise ValueError()
             return content

@@ -16,10 +16,10 @@ class ExtraFieldTests(unittest.TestCase):
             path = root/"NR_SRS.flag.csv"
             with path.open("w",newline="") as stream:
                 writer = csv.writer(stream)
-                writer.writerow(["uwTtiCnt1","logicCellId","crnti","uwData","uwTime","usrRsrp","srsUeNiDb","featureB"])
-                writer.writerow([1,0,10,"2026-10-22","00:00:00.000",-100,-110,0])
-                writer.writerow([2,0,10,"2026-10-22","00:00:01.000",-100,-110,1])
-                writer.writerow([3,0,10,"2026-10-22","00:00:02.000",-100,-110,""])
+                writer.writerow(["ueLayerNum","uwTtiCnt1","logicCellId","crnti","uwData","uwTime","usrRsrp","srsUeNiDb","featureB"])
+                writer.writerow([4,1,0,10,"2026-10-22","00:00:00.000",-100,-110,0])
+                writer.writerow([4,2,0,10,"2026-10-22","00:00:01.000",-100,-110,1])
+                writer.writerow([4,3,0,10,"2026-10-22","00:00:02.000",-100,-110,""])
             directory,meta = build_dataset(path,root/"store",json.loads(Path("config/input_contract.json").read_text()))
             source = {"document_id":"synthetic","revision":"1","section":"full rule"}
             feature = {"feature_id":"B","title":"Synthetic B","flag_field":"featureB","conditions":[

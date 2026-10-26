@@ -1,5 +1,6 @@
 """Structured explanation checks with safe, actionable diagnostic locations."""
 from .evidence import validate_numeric_claim
+from .performance import validation_event
 
 UNITS = {'gain_avg':'dB','instBfSinrGain':'dB','comparison_diff':'dB',
          'rsrp_avg':'dBm','ni_avg':'dBm','usrRsrp':'dBm','srsUeNiDb':'dBm'}
@@ -20,10 +21,18 @@ def validate_explanation(output, artifacts, references):
     if not isinstance(claims,list) or len(claims)>20:
         fail('INVALID_CLAIMS_LIST','claims')
     known = {a['artifact_id']:a for a in artifacts}
+    def normalize_ref(value, location):
+        if isinstance(value,str) and value.startswith(('artifact:', 'artifact：')):
+            normalized = value[9:].strip()
+            if normalized in known:
+                validation_event('reference_normalization',1,{'location':location,'operation':'REMOVE_ARTIFACT_PREFIX'})
+                return normalized
+        return value
     for i,c in enumerate(claims):
         loc = f'claims[{i}]'
         if not isinstance(c,dict) or not {'artifact_id','row_key','column','value','unit'} <= c.keys():
             fail('MISSING_CLAIM_FIELDS',loc)
+        c['artifact_id'] = normalize_ref(c['artifact_id'],loc+'.artifact_id')
         if not isinstance(c['artifact_id'],str) or c['artifact_id'] not in known:
             fail('UNKNOWN_ARTIFACT',loc+'.artifact_id')
         if not isinstance(c['column'],str) or c['column'] not in UNITS:
@@ -46,6 +55,9 @@ def validate_explanation(output, artifacts, references):
         if not isinstance(item,dict) or not isinstance(item.get('text'),str):
             fail('INVALID_HYPOTHESIS',loc)
         refs = item.get('references')
+        if isinstance(refs,list):
+            refs = [normalize_ref(r,loc+'.references') for r in refs]
+            item['references'] = refs
         if not isinstance(refs,list) or not refs or any(not isinstance(r,str) or r not in allowed for r in refs):
             fail('UNBOUND_HYPOTHESIS',loc+'.references')
     return claims,items

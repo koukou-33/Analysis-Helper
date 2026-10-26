@@ -91,6 +91,9 @@ def measured(stage):
                     elif stage == 'diagnosis' and isinstance(result, dict):
                         record.update({k: result[k] for k in ('dataset_id','session_id','action_id') if k in result})
                         record['analysis_status'] = result.get('status')
+                        record['backfill_rounds'] = result.get('backfill_rounds',0)
+                        record['requirement_count'] = len(result.get('requirements',[]))
+                        record['covered_requirements'] = sum(r.get('status')=='COVERED' for r in result.get('requirements',[]))
                     elif stage in {'query_plan','manual_sql'}:
                         record.update(artifact_count=len(result), output_rows=sum(a['row_count'] for a in result))
                     elif stage == 'summary':

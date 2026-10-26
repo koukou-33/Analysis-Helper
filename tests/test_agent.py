@@ -29,7 +29,7 @@ class AgentTests(unittest.TestCase):
         aid = str(uuid4())
         first = engine.run(sid,"查看四流增益",Scope(logic_cell_id=0),aid)
         self.assertEqual(first["summary"]["flow_valid_count"],40)
-        self.assertEqual(first["steps"],["retrieve","plan","execute","verify","explain"])
+        self.assertEqual(first["steps"],["retrieve","requirements","plan","execute","coverage","verify","explain"])
         reopened = DiagnosticEngine(storage,self.root/"empty_assets",model=ModelService(ServiceConfig()))
         same = reopened.run(sid,"查看四流增益",Scope(logic_cell_id=0),aid)
         self.assertEqual(same,first)
@@ -78,12 +78,12 @@ class AgentTests(unittest.TestCase):
             def chat_json(self,messages):
                 self.calls += 1
                 if self.calls == 1:
-                    plan = default_plan(parent.normal_meta,'test').model_dump(mode='json')
+                    plan = default_plan(parent.normal_meta,'增益').model_dump(mode='json')
                     plan['steps'] = [{'step_id':'s1','operator':'CONDITION_COUNT','condition':{'op':'eq','field':'gain_missing','value':True}}]
                     return plan
                 if self.calls == 2:
                     parent.assertIn('CONDITION_COUNT',messages[-1].content)
-                    return default_plan(parent.normal_meta,'test').model_dump(mode='json')
+                    return default_plan(parent.normal_meta,'增益').model_dump(mode='json')
                 return {'claims':[],'hypotheses':[{'text':'guess','references':['not_known']}]}
         engine = DiagnosticEngine(self.root/'agent_diagnostics',self.root/'empty_assets',model=RepairModel())
         sid = engine.store.create(self.normal_db)
@@ -110,7 +110,7 @@ class AgentTests(unittest.TestCase):
                 self.calls += 1
                 parent.assertIn('不属于 UNCONFIRMED_ARRAY',messages[0].content)
                 if self.calls<=2:
-                    plan = default_plan(parent.normal_meta,'test').model_dump(mode='json')
+                    plan = default_plan(parent.normal_meta,'增益').model_dump(mode='json')
                     plan['steps'].append({'step_id':'s2','operator':'COMPARE','source':'stream' if self.calls==1 else 's1',
                                           'depends_on':[] if self.calls==1 else ['s1'],'compare_field':'gain_avg'})
                     if self.calls==2:
@@ -130,8 +130,8 @@ class AgentTests(unittest.TestCase):
         path=self.root/'empty_gains.csv'
         with path.open('w',newline='',encoding='utf-8') as stream:
             writer=csv.writer(stream)
-            writer.writerow(['uwTtiCnt1','logicCellId','crnti','uwData','uwTime']+[f'instBfSinrGain[{i}]' for i in range(4)])
-            writer.writerow([1,0,10,'2026-10-26','00:00:00.000','','','',''])
+            writer.writerow(['ueLayerNum','uwTtiCnt1','logicCellId','crnti','uwData','uwTime']+[f'instBfSinrGain[{i}]' for i in range(4)])
+            writer.writerow([4,1,0,10,'2026-10-26','00:00:00.000','','','',''])
         directory,meta=build_dataset(path,self.root/'empty_gain_store',json.loads(Path('config/input_contract.json').read_text()))
         class Model:
             config=ServiceConfig(provider='local_openai',base_url='http://example',model='test')
@@ -143,7 +143,7 @@ class AgentTests(unittest.TestCase):
                 return default_plan(meta,'test').model_dump(mode='json')
         model=Model()
         engine=DiagnosticEngine(self.root/'agent_missing',self.root/'empty_assets',model=model)
-        result=engine.run(engine.store.create(directory),'test')
+        result=engine.run(engine.store.create(directory),'增益')
         self.assertEqual(model.calls,1)
         self.assertIn('四流映射已确认',result['answer'])
         self.assertEqual(result['hypotheses'],[])

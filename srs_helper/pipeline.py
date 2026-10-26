@@ -15,7 +15,7 @@ import duckdb
 import pyarrow as pa
 from .schema import bindings, column_catalog
 
-RULE_VERSION = "m1.3"
+RULE_VERSION = "m1.4"
 CAPTURE_NAME = re.compile(r"NR_SRS(?:\(\d+\))?_\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.csv", re.IGNORECASE)
 LEGACY_CAPTURE_NAME = re.compile(r"NR_SRS\..+\.csv", re.IGNORECASE)
 
@@ -25,7 +25,7 @@ def is_capture_name(name):
 
 GAIN_FIELDS = tuple(f"instBfSinrGain[{i}]" for i in range(4))
 NUMBERS = ("uwTtiCnt1", "logicCellId", "crnti", "phyCellInst", "resourceId",
-           "frmNum", "subFrmNum", "slot", "freqRbStart", "freqRbNum", "usrRsrp", "srsUeNiDb") + GAIN_FIELDS
+           "frmNum", "subFrmNum", "slot", "freqRbStart", "freqRbNum", "usrRsrp", "srsUeNiDb", "ueLayerNum", "ueSymPos") + GAIN_FIELDS
 INTEGERS = set(NUMBERS) - {"usrRsrp", "srsUeNiDb", *GAIN_FIELDS}
 
 
@@ -261,7 +261,13 @@ WITH prev AS (
  OR coalesce(srsUeNiDb<=-130 OR srsUeNiDb>=-80,false)) AS is_suspicious,
  flow_status='VALID_FLOW' AND (rsrp_missing OR ni_missing) AS has_missing_measurement FROM flow
 )
-SELECT *, CASE WHEN flow_status <> 'VALID_FLOW' THEN 'INVALID_FLOW_CTRL'
+SELECT *, coalesce(ueLayerNum IN (1,2,4,8),false) AS layer_count_valid,
+ flow_status='VALID_FLOW' AND coalesce(ueLayerNum IN (1,2,4,8),false) AND NOT is_suspicious AS business_eligible,
+ coalesce(usrRsrp<=-160 OR usrRsrp>=-60,false) AS rsrp_suspicious,
+ coalesce(srsUeNiDb<=-130 OR srsUeNiDb>=-80,false) AS ni_suspicious,
+ CASE WHEN ueLayerNum=8 THEN 'FIRST_FOUR_ONLY' ELSE 'CONFIGURED_STREAMS' END AS stream_coverage,
+ CASE WHEN flow_status <> 'VALID_FLOW' THEN 'INVALID_FLOW_CTRL'
+ WHEN ueLayerNum IS NULL OR ueLayerNum NOT IN (1,2,4,8) THEN 'INVALID_LAYER_COUNT'
  WHEN has_parse_error THEN 'PARSE_ERROR' WHEN is_suspicious THEN 'SUSPICIOUS'
  WHEN has_missing_measurement THEN 'MISSING_DATA' ELSE 'VALID_NORMAL' END AS data_quality_tag
 FROM flags;
@@ -279,11 +285,15 @@ WITH prev AS (
 SELECT record_id, concat(logicCellId,'_',crnti,'_',
  strftime(min(event_ts) OVER (PARTITION BY logicCellId,crnti,segment),'%Y-%m-%dT%H:%M:%S.%f')) AS ue_uid FROM segments;
 CREATE TABLE l4_ue_resource_ts AS
-SELECT l.*, s.ue_uid, CASE WHEN s.ue_uid IS NULL THEN 'IDENTITY_OR_TIME_UNAVAILABLE' END AS session_unassigned_reason,
+SELECT l.* REPLACE (
+ CASE WHEN ueLayerNum>0 THEN "instBfSinrGain[0]" END AS "instBfSinrGain[0]",
+ CASE WHEN ueLayerNum>1 THEN "instBfSinrGain[1]" END AS "instBfSinrGain[1]",
+ CASE WHEN ueLayerNum>2 THEN "instBfSinrGain[2]" END AS "instBfSinrGain[2]",
+ CASE WHEN ueLayerNum>3 THEN "instBfSinrGain[3]" END AS "instBfSinrGain[3]"), s.ue_uid, CASE WHEN s.ue_uid IS NULL THEN 'IDENTITY_OR_TIME_UNAVAILABLE' END AS session_unassigned_reason,
  epoch(event_ts-(SELECT min(event_ts) FROM l2_standardized)) AS time_sec,
  CASE WHEN subFrmNum BETWEEN 0 AND 9 AND slot BETWEEN 0 AND 1 THEN subFrmNum*2+slot END AS slot_in_frame,
  CASE WHEN freqRbNum>0 THEN freqRbStart+freqRbNum-1 END AS freqRbEnd
-FROM l3_cleaned_srs l LEFT JOIN assigned_sessions s USING(record_id) WHERE flow_status='VALID_FLOW';
+FROM l3_cleaned_srs l LEFT JOIN assigned_sessions s USING(record_id) WHERE business_eligible;
 CREATE TABLE l4_ue_summary AS SELECT logicCellId,ue_uid,resourceId,
  count(*) AS sample_cnt, count(usrRsrp) AS rsrp_valid_cnt, count(srsUeNiDb) AS ni_valid_cnt,
  avg(usrRsrp) AS rsrp_avg, stddev_samp(usrRsrp) AS rsrp_std,
@@ -306,7 +316,7 @@ SELECT r.*, s.streamId,
  json_contains(error_reasons,to_json(concat('instBfSinrGain[',s.streamId,']:MISSING_VALUE'))) AS gain_missing,
  json_contains(error_reasons,to_json(concat('instBfSinrGain[',s.streamId,']:PARSE_ERROR')))
  OR json_contains(error_reasons,to_json(concat('instBfSinrGain[',s.streamId,']:NON_FINITE'))) AS gain_parse_error
-FROM l4_ue_resource_ts r CROSS JOIN range(4) s(streamId);
+FROM l4_ue_resource_ts r CROSS JOIN range(4) s(streamId) WHERE s.streamId < r.ueLayerNum;
 CREATE UNIQUE INDEX stream_record_key ON l4_ue_stream_ts(record_id,streamId);
 CREATE TABLE l4_ue_stream_summary AS
 SELECT logicCellId,ue_uid,resourceId,streamId,count(*) AS sample_cnt,

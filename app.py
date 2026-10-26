@@ -132,19 +132,21 @@ with left:
             st.caption("块级预览最多 100 个块；完整信息可下载。")
             st.download_button("下载质量报告",dumps(report),file_name="quality_report.json")
             st.json(report["files"])
-        dataset_ok = True
+        dataset_ok = report.get('rule_version')=='m1.4'
+        if not dataset_ok:
+            st.info('旧数据仅供查看历史结果；请重新加载 CSV 以应用实际流数和整行排除规则。')
     except Exception:
         dataset_ok = False
         st.error("会话数据集不可用；仍可查看已保存历史。")
 
 
-def run_question(question, plan_override=None,sql_override=None):
+def run_question(question, plan_override=None,sql_override=None,peer_comparison=False):
     action_id = str(uuid4())
     st.session_state["pending_action"] = {"sid":sid,"action_id":action_id,"question":question,
-                                          "scope":scope.__dict__,"feature_path":feature_path,"plan_override":plan_override,"sql_override":sql_override}
+                                          "scope":scope.__dict__,"feature_path":feature_path,"plan_override":plan_override,"sql_override":sql_override,"peer_comparison":peer_comparison}
     try:
         with st.status("正在分析",expanded=True) as status:
-            engine.run(sid,question,scope,action_id,feature_path=feature_path,progress=lambda step:st.write(step),plan_override=plan_override,sql_override=sql_override)
+            engine.run(sid,question,scope,action_id,feature_path=feature_path,progress=lambda step:st.write(step),plan_override=plan_override,sql_override=sql_override,peer_comparison=peer_comparison)
             status.update(label="分析完成",state="complete")
         st.session_state.pop("pending_action",None)
         st.rerun()
@@ -156,14 +158,15 @@ with middle:
     st.subheader("诊断与追问")
     with st.form("question_"+sid):
         question = st.text_area("问题描述",value="比较各流增益，查看异常比例与缺测情况。")
+        peer_comparison = st.checkbox("明确请求同侪比较（需选择目标 UE 或 CRNTI）",value=False)
         submitted = st.form_submit_button("开始分析",disabled=not(scope_valid and dataset_ok))
     if submitted and question.strip():
-        run_question(question)
+        run_question(question,peer_comparison=peer_comparison)
     pending = st.session_state.get("pending_action")
     if pending and pending["sid"]==sid and st.button("重试上次未完成操作",disabled=not dataset_ok):
         try:
             engine.run(sid,pending["question"],restore_scope(pending["scope"]),pending["action_id"],retry=True,
-                       feature_path=pending["feature_path"],plan_override=pending["plan_override"],sql_override=pending.get("sql_override"))
+                       feature_path=pending["feature_path"],plan_override=pending["plan_override"],sql_override=pending.get("sql_override"),peer_comparison=pending.get("peer_comparison",False))
             st.session_state.pop("pending_action",None)
             st.rerun()
         except Exception:
@@ -215,6 +218,19 @@ with right:
         if panel=="统计与图表":
             summary = result["summary"]
             st.metric("流控有效记录",summary["flow_valid_count"])
+            st.metric("业务准入记录",summary.get("business_valid_count",summary["flow_valid_count"]))
+            st.caption("统计策略："+summary['quality_policy']+"；规则版本："+summary.get('rule_version','历史版本'))
+            if summary.get('quality'):
+                st.json(summary['quality'])
+                if summary['quality'].get('partial_stream_count'):
+                    st.warning('存在 8 流记录：仅覆盖前四流。')
+            with st.expander("需求核账与补查"):
+                st.caption(f"补查轮数：{result.get('backfill_rounds',0)}")
+                st.dataframe(pd.DataFrame(result.get('requirements',[])),hide_index=True)
+                st.dataframe(pd.DataFrame(result.get('responsibility_evidence',[])),hide_index=True)
+                st.json(result.get('case_assessments',[]))
+            if result.get('peers',{}).get('status') not in {None,'NOT_REQUESTED'}:
+                st.write({k:v for k,v in result['peers'].items() if k!='artifacts'})
             groups = pd.DataFrame(summary["groups"])
             if not groups.empty:
                 show_all = st.checkbox("展示全部会话",value=False)

@@ -18,7 +18,7 @@ class SyntheticQueryTests(unittest.TestCase):
         cls.template = cls.root / "template.csv"
         cls.header = ["uwTtiCnt1", "logicCellId", "crnti", "uwDate", "uwTime", "slotId",
                       "l2PhyCellInst", "freqUserRbStart", "freqUserRbNum", "resourceId", "frmNum",
-                      "subFrmNum", "usrRsrp", "srsUeNiDb"] + [f"instBfSinrGain[{i}]" for i in range(4)] + ["tag", "tag"]
+                      "subFrmNum", "usrRsrp", "srsUeNiDb", "ueLayerNum", "ueSymPos"] + [f"instBfSinrGain[{i}]" for i in range(4)] + ["tag", "tag"]
         with cls.template.open("w", newline="", encoding="utf-8") as stream:
             writer = csv.writer(stream)
             writer.writerow(cls.header)
@@ -54,7 +54,7 @@ class SyntheticQueryTests(unittest.TestCase):
         result = summarize(self.mixed_db)
         self.assertEqual(result["flow_valid_count"], sum(r["flow_valid"] for r in self.mixed_truth["truth"]))
         self.assertEqual(result["flow_valid_count"], 34)
-        self.assertEqual(sum(g["suspicious_cnt"] for g in result["groups"]), 4)
+        self.assertEqual(result["quality"]["suspicious_count"], 4)
         self.assertEqual(sum(s["gain_parse_error_cnt"] for s in result["streams"]), 4)
         self.assertEqual(sum(s["gain_missing_cnt"] for s in result["streams"]), 4)
 

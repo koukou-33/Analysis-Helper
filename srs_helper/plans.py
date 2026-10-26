@@ -81,7 +81,7 @@ class QueryPlan(BaseModel):
     dataset_id: str
     dataset_fingerprint: str
     question: str
-    quality_policy: Literal["INCLUDE_ALL_NUMERIC"] = "INCLUDE_ALL_NUMERIC"
+    quality_policy: Literal["INCLUDE_ALL_NUMERIC", "EXCLUDE_ABNORMAL_RECORD"] = "EXCLUDE_ABNORMAL_RECORD"
     steps: list[Step] = Field(min_length=1, max_length=8)
     document_refs: list[dict] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
@@ -193,11 +193,18 @@ def expression_sql(expr, columns, params, depth=0):
 
 
 def default_plan(meta, question):
-    return QueryPlan(dataset_id=meta["dataset_id"],dataset_fingerprint=meta["dataset_fingerprint"],question=question,
-                     limitations=["默认描述性统计；尚未进行特性根因判断"],steps=[Step(step_id="s1",operator="GROUP_AGG",
-                     source="stream",group_by=["logicCellId","ue_uid","resourceId","streamId"],metrics=[
-                         Metric(field="instBfSinrGain",aggregate="avg",output="gain_avg"),
-                         Metric(field="instBfSinrGain",aggregate="count",output="gain_valid_cnt")])])
+    from .requirements import question_requirements, backfill_plan
+    from .pipeline import NUMBERS
+    columns = {'resource':list(NUMBERS),'stream':['instBfSinrGain']}
+    requirements = question_requirements(question,columns)
+    requested = backfill_plan(meta,question,requirements)
+    if requested:
+        return requested
+    return QueryPlan(dataset_id=meta['dataset_id'],dataset_fingerprint=meta['dataset_fingerprint'],question=question,
+                     quality_policy='EXCLUDE_ABNORMAL_RECORD' if meta.get('rule_version')=='m1.4' else 'INCLUDE_ALL_NUMERIC',
+                     steps=[Step(step_id='s1',operator='GROUP_AGG',source='resource',metrics=[
+                         Metric(field='record_id',aggregate='count',output='record_count')])])
+
 
 
 def supplemental_columns(con):
@@ -269,13 +276,14 @@ def prepare_scope(con,scope,required_fields=()):
 
 
 @measured("query_plan")
-def execute_plan(directory, scope, plan, output_dir):
+def execute_plan(directory, scope, plan, output_dir, seconds=30):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True,exist_ok=True)
     results = []
-    with open_dataset(directory) as (con,meta):
+    with open_dataset(directory, seconds=seconds) as (con,meta):
         if (plan.dataset_id,plan.dataset_fingerprint) != (meta["dataset_id"],meta["dataset_fingerprint"]):
             raise ValueError("Plan belongs to another dataset version")
+        plan = plan.model_copy(update={"quality_policy": "EXCLUDE_ABNORMAL_RECORD" if meta["rule_version"]=="m1.4" else "INCLUDE_ALL_NUMERIC"})
         validate_plan_fields(plan,scope_columns(con))
         prepare_scope(con,scope,plan_fields(plan))
         for step in plan.steps:
@@ -345,6 +353,9 @@ def execute_plan(directory, scope, plan, output_dir):
             con.execute(f'CREATE TEMP TABLE "{step.step_id}" AS '+sql,parameters)
             result = export_relation(con,step.step_id,output_dir,plan,scope,step.operator)
             result.update(sql=sql,parameters=parameters,purpose=step.purpose)
+            # Only direct full-scope metrics qualify; filtered/derived relations need separate proof.
+            result['metric_evidence'] = [dict(field=m.field,aggregate=m.aggregate,output=m.output,relation=step.source)
+                                        for m in step.metrics] if step.operator=='GROUP_AGG' and step.source in {'resource','stream'} else []
             results.append(result)
     return results
 

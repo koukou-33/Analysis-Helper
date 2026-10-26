@@ -15,7 +15,7 @@ def generate(template, output, seed=20261022, blocks=50, files=2, profile="norma
         header = next(csv.reader(stream))
     fields = ["uwTtiCnt1", "logicCellId", "crnti", "uwDate", "uwTime", "slotId",
               "l2PhyCellInst", "freqUserRbStart", "freqUserRbNum", "resourceId", "frmNum",
-              "subFrmNum", "usrRsrp", "srsUeNiDb"] + [f"instBfSinrGain[{i}]" for i in range(4)]
+              "subFrmNum", "usrRsrp", "srsUeNiDb", "ueLayerNum", "ueSymPos"] + [f"instBfSinrGain[{i}]" for i in range(4)]
     counts = Counter(header)
     if any(counts[n] != 1 for n in fields):
         raise ValueError("Template must have exactly one of every mapped calculation field")
@@ -45,7 +45,7 @@ def generate(template, output, seed=20261022, blocks=50, files=2, profile="norma
                     gains = [round(rng.uniform(14, 20), 3)]
                     for _ in range(3):
                         gains.append(round(gains[-1] - rng.uniform(1, 3), 3))
-                    values = dict(uwTtiCnt1=block, logicCellId=idx % 2, crnti=1000+idx,
+                    values = dict(ueLayerNum=4, ueSymPos=0, uwTtiCnt1=block, logicCellId=idx % 2, crnti=1000+idx,
                                   uwDate=timestamp.strftime("%Y-%m-%d"), uwTime=timestamp.strftime("%H:%M:%S"),
                                   slotId=idx % 2, l2PhyCellInst=70+idx % 2, freqUserRbStart=(block % 2)*24,
                                   freqUserRbNum=24, resourceId=block % 2, frmNum=(number//20) % 1024,

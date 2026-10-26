@@ -41,12 +41,22 @@ def summarize(dataset_dir, scope=None, dataset_id=None):
     scope = scope or Scope()
     where, parameters = scope.where()
     with open_dataset(dataset_dir) as (con, meta):
-        if meta["status"] not in {"READY", "PARTIAL_READY"} or meta["rule_version"] not in {"m1.2","m1.3"}:
+        if meta["status"] not in {"READY", "PARTIAL_READY"} or meta["rule_version"] not in {"m1.2","m1.3","m1.4"}:
             raise ValueError("Dataset is not ready or has an unsupported schema version")
         if dataset_id is not None and dataset_id != meta["dataset_id"]:
             raise ValueError("Dataset identity mismatch")
         # A temporary scoped relation avoids interpolating values and never changes persisted tables.
         con.execute(f"CREATE TEMP TABLE scoped AS SELECT * FROM l4_ue_resource_ts WHERE {where}", parameters)
+        quality = {}
+        if meta['rule_version'] == 'm1.4':
+            cursor = con.execute(f"""SELECT count(*) AS flow_valid_count,
+                count(*) FILTER(WHERE NOT business_eligible) AS excluded_count,
+                count(*) FILTER(WHERE is_suspicious) AS suspicious_count,
+                count(*) FILTER(WHERE NOT layer_count_valid) AS invalid_layer_count,
+                count(*) FILTER(WHERE business_eligible AND ueLayerNum=8) AS partial_stream_count
+                FROM l3_cleaned_srs LEFT JOIN assigned_sessions USING(record_id)
+                WHERE flow_status='VALID_FLOW' AND ({where})""", parameters)
+            quality = dict(zip([d[0] for d in cursor.description], cursor.fetchone()))
         baseline = con.execute("SELECT count(*),count(ue_uid),count(usrRsrp),count(srsUeNiDb),count(*) FILTER(WHERE event_ts IS NULL) FROM scoped").fetchone()
         excluded_time = con.execute("SELECT count(*) FROM l4_ue_resource_ts WHERE event_ts IS NULL").fetchone()[0] if scope.start or scope.end else 0
         def records(sql):
@@ -104,10 +114,21 @@ def summarize(dataset_dir, scope=None, dataset_id=None):
                          available_streams=[s["streamId"] for s in valid],
                          max_stream_gain_diff=max(s["gain_avg"] for s in valid)-min(s["gain_avg"] for s in valid) if len(valid)>=2 else None,
                          ue_total_records=totals[group["ue_uid"]])
+        if meta['rule_version']=='m1.4':
+            audit = con.execute(f"""SELECT logicCellId,ue_uid,resourceId,count(*) AS audit_sample_cnt,
+                count(*) FILTER(WHERE is_suspicious) AS suspicious_cnt,
+                avg(is_suspicious::INT) AS suspicious_ratio,
+                count(*) FILTER(WHERE NOT layer_count_valid) AS invalid_layer_cnt
+                FROM l3_cleaned_srs LEFT JOIN assigned_sessions USING(record_id)
+                WHERE flow_status='VALID_FLOW' AND ({where}) GROUP BY logicCellId,ue_uid,resourceId""",parameters)
+            names=[d[0] for d in audit.description]
+            by_key={tuple(row[:3]):dict(zip(names[3:],row[3:])) for row in audit.fetchall()}
+            for group in groups:
+                group.update(by_key.get((group['logicCellId'],group['ue_uid'],group['resourceId']),{}))
         return {"dataset_id": meta["dataset_id"], "dataset_fingerprint": meta["dataset_fingerprint"],
-                "scope": scope.__dict__, "quality_policy": "INCLUDE_ALL_NUMERIC", "gain_unit": "dB",
+                "scope": scope.__dict__, "quality_policy": "EXCLUDE_ABNORMAL_RECORD" if meta["rule_version"]=="m1.4" else "INCLUDE_ALL_NUMERIC", "rule_version": meta["rule_version"], "gain_unit": "dB",
                 "rsrp_ni_unit": "dBm", "mean_policy": "arithmetic mean of finite input values",
-                "flow_valid_count": baseline[0], "session_assigned_count": baseline[1],
+                "quality": quality, "business_valid_count": baseline[0], "flow_valid_count": quality.get("flow_valid_count",baseline[0]), "session_assigned_count": baseline[1],
                 "rsrp_valid_count": baseline[2], "ni_valid_count": baseline[3],
                 "unlocated_time_count_in_scope": baseline[4], "dataset_unlocated_time_excluded": excluded_time,
                 "groups": groups, "streams": streams,"cell_tf":cell_tf}
