@@ -132,7 +132,7 @@ with left:
             st.caption("块级预览最多 100 个块；完整信息可下载。")
             st.download_button("下载质量报告",dumps(report),file_name="quality_report.json")
             st.json(report["files"])
-        dataset_ok = report.get('rule_version')=='m1.4'
+        dataset_ok = report.get('rule_version') in {'m1.4','m1.5'}
         if not dataset_ok:
             st.info('旧数据仅供查看历史结果；请重新加载 CSV 以应用实际流数和整行排除规则。')
     except Exception:

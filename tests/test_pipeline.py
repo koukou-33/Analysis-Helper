@@ -148,11 +148,12 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(c.execute("SELECT count(*) FROM field_catalog WHERE raw_name='tag'").fetchone()[0], 2)
         self.assertEqual(c.execute("SELECT domain FROM field_catalog WHERE raw_name='other[0]'").fetchone()[0], "UNCONFIRMED_ARRAY")
 
-    def test_duplicate_calculation_field_rejected(self):
+    def test_duplicate_calculation_conflict_preserves_flow_presence(self):
         self.write([self.row() + [20]], extra_header=["crnti"])
-        _, meta = self.build()
-        self.assertEqual(meta["status"], "FAILED")
-        self.assertIn("Ambiguous mapped field", meta["files"][0]["error"])
+        con, meta = self.build()
+        self.assertEqual(meta["status"], "READY")
+        self.assertEqual(con.execute('SELECT crnti,crnti_present,flow_status FROM l3_cleaned_srs').fetchone(),(None,True,'VALID_FLOW'))
+        self.assertIn('crnti:DUPLICATE_VALUE_CONFLICT',con.execute('SELECT error_reasons FROM l2_standardized').fetchone()[0])
 
     def test_unstable_snapshot_is_not_published_as_ready(self):
         self.write([self.row()])

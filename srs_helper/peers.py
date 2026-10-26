@@ -17,7 +17,7 @@ def compare_peers(directory, scope, fields, output_dir, *, enabled=False):
     matched = False
     Path(output_dir).mkdir(parents=True,exist_ok=True)
     with open_dataset(directory) as (con,meta):
-        if meta['rule_version']!='m1.4':
+        if meta['rule_version'] not in {'m1.4','m1.5'}:
             return {"status":"RELOAD_REQUIRED", "reason":"请重新加载，以应用实际流数和整行排除规则。", "artifacts":[]}
         where,params = scope.where()
         con.execute(f'CREATE TEMP TABLE target AS SELECT * FROM l4_ue_resource_ts WHERE {where}', params)

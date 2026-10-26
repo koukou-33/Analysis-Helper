@@ -91,7 +91,7 @@ class DiagnosticEngine:
         with open_dataset(session["dataset_dir"]) as (con,meta):
             if (meta["dataset_id"],meta["dataset_fingerprint"]) != (session["dataset_id"],session["fingerprint"]):
                 raise ValueError("Session dataset version no longer matches")
-            if meta['rule_version']!='m1.4':
+            if meta['rule_version'] not in {'m1.4','m1.5'}:
                 raise ValueError('历史数据仅供恢复；请重新加载为 m1.4 后发起新分析。')
             columns = scope_columns(con)
         folder = self.store.directory(sid)/"artifacts"
@@ -164,7 +164,7 @@ class DiagnosticEngine:
                             plan = default_plan(meta,question)
             else:
                 notices.append("尚未配置诊断模型，请填写 .env；本轮运行确定性统计。")
-            plan = plan.model_copy(update={"quality_policy":"EXCLUDE_ABNORMAL_RECORD" if meta["rule_version"]=="m1.4" else "INCLUDE_ALL_NUMERIC"})
+            plan = plan.model_copy(update={"quality_policy":"EXCLUDE_ABNORMAL_RECORD" if meta["rule_version"]in {"m1.4","m1.5"} else "INCLUDE_ALL_NUMERIC"})
             save_progress(plan=plan.model_dump(mode="json"))
             return {"plan":plan.model_dump(mode="json"),"notices":notices,"steps":state["steps"]+["plan"]}
         def execute(state):
@@ -211,7 +211,7 @@ class DiagnosticEngine:
                 ephemeral['case_assessments']=[{'status':'QUERY_FAILED','route':'EXPLORATION','reason':type(exc).__name__}]
             feature = None
             selected_feature = feature_path
-            if not selected_feature and any(word in question for word in ("特性","生效","条件")):
+            if not selected_feature and (any(word in question for word in ("特性","生效","条件")) or any(d["kind"]=="feature" and d["metadata"].get("feature_id", "__unknown__").casefold() in question.casefold() for d in ephemeral["documents"])):
                 retrieved_features = [d for d in ephemeral["documents"] if d["kind"]=="feature"]
                 if len(retrieved_features)==1:
                     selected_feature = retrieved_features[0]["path"]

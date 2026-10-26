@@ -28,12 +28,15 @@ def evaluate(expr, row):
     value = row[expr.field]
     if expr.op == "is_null":
         return value is None
-    if value is None or expr.value is None:
+    right = row.get(expr.value_field) if expr.value_field is not None else expr.value
+    if value is None or right is None:
+        return None
+    if any(isinstance(v,float) and not math.isfinite(v) for v in (value,right)):
         return None
     try:
-        return {"eq":lambda:value==expr.value,"ne":lambda:value!=expr.value,
-                "gt":lambda:value>expr.value,"ge":lambda:value>=expr.value,
-                "lt":lambda:value<expr.value,"le":lambda:value<=expr.value}[expr.op]()
+        return {"eq":lambda:value==right,"ne":lambda:value!=right,
+                "gt":lambda:value>right,"ge":lambda:value>=right,
+                "lt":lambda:value<right,"le":lambda:value<=right}[expr.op]()
     except TypeError:
         return None
 
@@ -57,7 +60,7 @@ def feature_analysis(directory, scope, meta, feature, output_dir):
     if complete_rule:
         rule = Expression.model_validate(feature.activation_logic)
         def referenced_fields(expr):
-            return ({expr.field} if expr.field else set()) | set().union(*(referenced_fields(e) for e in expr.args))
+            return ({expr.field} if expr.field else set()) | ({expr.value_field} if expr.value_field else set()) | set().union(*(referenced_fields(e) for e in expr.args))
         if not referenced_fields(rule)<=ids:
             raise ValueError("Activation logic must reference evaluated condition IDs")
     rule_conflict_count = 0

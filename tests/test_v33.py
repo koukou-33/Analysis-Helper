@@ -114,7 +114,7 @@ class V33Tests(unittest.TestCase):
                 for n,layer in enumerate([1,2,4,8,0,'',-1,1.5,3,4]):
                     writer.writerow([n,1,10,'2026-10-26','00:00:00.000',layer,-50 if n==9 else -100,-110,4,3,2,1])
             directory, meta = build_dataset(p,root/'datasets',json.loads(Path('config/input_contract.json').read_text()))
-            self.assertEqual(meta['rule_version'],'m1.4')
+            self.assertEqual(meta['rule_version'],'m1.5')
             with open_dataset(directory) as (con,_):
                 self.assertEqual(con.execute('SELECT count(*) FROM l4_ue_resource_ts').fetchone()[0],4)
                 self.assertEqual(con.execute('SELECT streamId,count(*) FROM l4_ue_stream_ts GROUP BY ALL ORDER BY 1').fetchall(),[(0,4),(1,3),(2,2),(3,2)])

@@ -20,7 +20,7 @@ def open_dataset(directory, seconds=30):
             raise ValueError("Dataset completion metadata must have exactly one row")
         meta = json.loads(con.execute("SELECT metadata FROM _etl_meta").fetchone()[0])
         disk = json.loads((directory / "input_manifest.json").read_text(encoding="utf-8"))
-        if meta != disk or meta["status"] not in {"READY", "PARTIAL_READY"} or meta["rule_version"] not in {"m1.2","m1.3","m1.4"}:
+        if meta != disk or meta["status"] not in {"READY", "PARTIAL_READY"} or meta["rule_version"] not in {"m1.2","m1.3","m1.4","m1.5"}:
             raise ValueError("Dataset metadata is incomplete, inconsistent, or unsupported")
         timer.start()
         yield con, meta
@@ -36,7 +36,7 @@ def quality_report(directory):
             cur = con.execute(sql)
             names = [c[0] for c in cur.description]
             return [dict(zip(names, row)) for row in cur.fetchall()]
-        extra_errors = rows("SELECT field_name,parse_state,count(*) AS records FROM l2_extra_numeric WHERE parse_state<>'VALID' GROUP BY ALL") if meta["rule_version"] in {"m1.3","m1.4"} else []
+        extra_errors = rows("SELECT field_name,parse_state,count(*) AS records FROM l2_extra_numeric WHERE parse_state<>'VALID' GROUP BY ALL") if meta["rule_version"] in {"m1.3","m1.4","m1.5"} else []
         return {"dataset_id": meta["dataset_id"], "rule_version":meta['rule_version'], "files": meta["files"],"supplemental_field_errors":extra_errors,
                 "baseline": rows("""SELECT count(*) AS loaded_count,
                   count(*) FILTER(WHERE NOT csv_structure_complete) AS structure_error_count,

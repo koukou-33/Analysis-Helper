@@ -844,3 +844,18 @@ LangGraph 扩展为检索→需求整理→计划与字段来源校验→执行�
 ### 17.6 本轮实现边界与验证
 
 本轮实现与测试记录见 docs/V33_DELIVERY.md。核账目前针对明确指标及相关结构化 required_metrics，不声称自动理解全部自然语言判据。案例 criteria 使用带出处的 FeatureCondition；没有可执行判据时仅作参考。补查累计预算不包含独立模型 HTTP 重试的端到端保证。同侪只核对起始符号，已知多符号不纳入；缺少符号数量仍不能证明完整覆盖一致。所有未确认门限保持未知。
+
+
+### 17.7 SPF 与重复列口径（2026-10-27）
+
+CSV 精确同名列逐行合并，采用唯一非空值；相同非空文本去重，不同非空文本标记 DUPLICATE_VALUE_CONFLICT，不任意挑选。原始数组和逐列位置目录保留，冲突字段不可参与数值判定；CRNTI 原始存在性仍取各同名列是否有非空值，冲突不视为缺失触发流控截断。ETL 升级 m1.5，旧版本保留。SPF 规则以 knowledge_assets/features/SPF特性相关分析指南.md 为准，新增 isAiranActInd=1 必要条件；本期分别分析独立数据集，不做 A/B 自动关联。
+
+### 17.8 同行字段比较与 SPF 完整规则（2026-10-27）
+
+Expression 新增可选 value_field，用于 eq/ne/gt/ge/lt/le 的右侧列引用；value 继续表示绑定参数常量。value_field 与非空 value 互斥，is_null 不接受右侧操作数，逻辑节点只接受 args。例：`{op: le, field: preSinr, value_field: spfPreSinrThd}`。
+
+两侧都进入步骤来源校验和按需补充字段清单；同一关系之外的已知字段拒绝并报告 value_field 定位。真正不存在的字段按 UNKNOWN 处理，不编造值；右侧列名通过同一标识符白名单和转义规则进入 SQL，禁止任意 SQL 表达式、隐式跨表关联和跨数据集比较。类型/单位需兼容，不自动缩放。
+
+SQL 与 Python 特性求值采用一致三值逻辑：比较任一侧 NULL 为 UNKNOWN；AND 遇 FALSE 为 FALSE，否则存在 UNKNOWN 为 UNKNOWN；OR 遇 TRUE 为 TRUE，否则存在 UNKNOWN 为 UNKNOWN。完整 activation_logic 仅能引用条件 ID，右侧引用亦受限制。实际标志非0/1为未知，不能计入“应生效但未生效”。
+
+SPF 文档提供结构化 FeatureSpec：小区开关、模型激活、历史门限、用户形态开关、瞬时门限五个必要条件的 AND 为完整预期生效规则；实际状态取 codeUsrSpfFlag。逐行使用门限，精确保留 <= 边界；isAiranActInd=0 时不得预期生效。结构化规则直接执行，不依赖模型提取。模型类型只在实际生效前提下解释，不将未生效时的 spfModelType=0 当作3D生效；不由预期/实际不一致自动确认根因。

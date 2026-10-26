@@ -18,7 +18,24 @@ class Expression(BaseModel):
     op: Literal["eq", "ne", "gt", "ge", "lt", "le", "and", "or", "not", "is_null"]
     field: str | None = None
     value: str | float | int | bool | None = None
+    value_field: str | None = None
     args: list["Expression"] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def operands(self):
+        if self.op in {'and','or','not'}:
+            if not self.args or (self.op=='not' and len(self.args)!=1):
+                raise ValueError('Logical expressions require arguments; not requires exactly one')
+            if self.field is not None or self.value is not None or self.value_field is not None:
+                raise ValueError('Logical expressions use args only')
+        else:
+            if not self.field or self.args:
+                raise ValueError('Comparison requires a field and no args')
+            if self.value_field is not None and (not self.value_field.strip() or self.value is not None):
+                raise ValueError('Use either value or value_field, never both')
+            if self.op=='is_null' and (self.value is not None or self.value_field is not None):
+                raise ValueError('is_null takes only field')
+        return self
 
 
 class Metric(BaseModel):
@@ -137,6 +154,8 @@ def validate_plan_fields(plan, base_columns):
                 condition(arg,source,f'{location}.args[{i}]')
         else:
             require(expr.field,source,location+'.field',allow_missing=True)
+            if expr.value_field is not None:
+                require(expr.value_field,source,location+'.value_field',allow_missing=True)
     for i,step in enumerate(plan.steps):
         prefix = f'steps[{i}]'
         source = step.source
@@ -180,16 +199,20 @@ def expression_sql(expr, columns, params, depth=0):
         parts = [expression_sql(e,columns,params,depth+1) for e in expr.args]
         return "(NOT " + parts[0] + ")" if expr.op == "not" else "("+(" AND " if expr.op=="and" else " OR ").join(parts)+")"
     # Missing feature fields are UNKNOWN, including missing-column is_null predicates.
-    if expr.field not in columns:
+    if expr.field not in columns or (expr.value_field is not None and expr.value_field not in columns):
         return "NULL::BOOLEAN"
     column = identifier(expr.field, columns)
     if expr.op == "is_null":
         return f"({column} IS NULL)"
     if isinstance(expr.value,float) and not math.isfinite(expr.value):
         raise ValueError("Non-finite expression value")
-    params.append(expr.value)
+    if expr.value_field is not None:
+        right = identifier(expr.value_field,columns)
+    else:
+        params.append(expr.value)
+        right = '?'
     operators = {"eq":"=", "ne":"<>", "gt":">", "ge":">=", "lt":"<", "le":"<="}
-    return f"({column} {operators[expr.op]} ?)"
+    return f"({column} {operators[expr.op]} {right})"
 
 
 def default_plan(meta, question):
@@ -201,7 +224,7 @@ def default_plan(meta, question):
     if requested:
         return requested
     return QueryPlan(dataset_id=meta['dataset_id'],dataset_fingerprint=meta['dataset_fingerprint'],question=question,
-                     quality_policy='EXCLUDE_ABNORMAL_RECORD' if meta.get('rule_version')=='m1.4' else 'INCLUDE_ALL_NUMERIC',
+                     quality_policy='EXCLUDE_ABNORMAL_RECORD' if meta.get('rule_version') in {'m1.4','m1.5'} else 'INCLUDE_ALL_NUMERIC',
                      steps=[Step(step_id='s1',operator='GROUP_AGG',source='resource',metrics=[
                          Metric(field='record_id',aggregate='count',output='record_count')])])
 
@@ -222,8 +245,10 @@ def supplemental_columns(con):
         header = entry['columns']
         mapped = set(bindings(header, meta['contract'], NUMBERS).values())
         counts = Counter(n.casefold() for n in header)
+        exact = Counter(header)
+        mapped_names = {header[i] for i in mapped}
         reserved = {n.casefold() for n in NUMBERS} | {'uwdata','uwdate','uwtime','record_id','source_file','event_ts','ue_uid','streamid'}
-        names.update(n for i,n in enumerate(header) if i not in mapped and counts[n.casefold()]==1
+        names.update(n for i,n in enumerate(header) if n not in mapped_names and (counts[n.casefold()]==exact[n] if meta['rule_version']=='m1.5' else counts[n.casefold()]==1)
                      and n.casefold() not in reserved and '[' not in n and n and len(n)<=100)
     return sorted(names)
 
@@ -233,7 +258,7 @@ def plan_fields(plan):
     def visit(value):
         if isinstance(value, dict):
             for key, item in value.items():
-                if key in {'field','compare_field'} and isinstance(item,str):
+                if key in {'field','compare_field','value_field'} and isinstance(item,str):
                     fields.add(item)
                 elif key in {'group_by','object_keys'}:
                     fields.update(item)
@@ -283,7 +308,7 @@ def execute_plan(directory, scope, plan, output_dir, seconds=30):
     with open_dataset(directory, seconds=seconds) as (con,meta):
         if (plan.dataset_id,plan.dataset_fingerprint) != (meta["dataset_id"],meta["dataset_fingerprint"]):
             raise ValueError("Plan belongs to another dataset version")
-        plan = plan.model_copy(update={"quality_policy": "EXCLUDE_ABNORMAL_RECORD" if meta["rule_version"]=="m1.4" else "INCLUDE_ALL_NUMERIC"})
+        plan = plan.model_copy(update={"quality_policy": "EXCLUDE_ABNORMAL_RECORD" if meta["rule_version"]in {"m1.4","m1.5"} else "INCLUDE_ALL_NUMERIC"})
         validate_plan_fields(plan,scope_columns(con))
         prepare_scope(con,scope,plan_fields(plan))
         for step in plan.steps:

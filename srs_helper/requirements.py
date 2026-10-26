@@ -113,4 +113,4 @@ def backfill_plan(meta, question, requirements, limit=10):
     if not steps:
         return None
     return QueryPlan(dataset_id=meta['dataset_id'],dataset_fingerprint=meta['dataset_fingerprint'],
-                     question=question,steps=steps,quality_policy='EXCLUDE_ABNORMAL_RECORD' if meta.get('rule_version')=='m1.4' else 'INCLUDE_ALL_NUMERIC')
+                     question=question,steps=steps,quality_policy='EXCLUDE_ABNORMAL_RECORD' if meta.get('rule_version') in {'m1.4','m1.5'} else 'INCLUDE_ALL_NUMERIC')
