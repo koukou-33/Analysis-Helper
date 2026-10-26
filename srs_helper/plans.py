@@ -113,6 +113,64 @@ def identifier(name, columns):
     return '"' + name.replace('"','""') + '"'
 
 
+class PlanFieldError(ValueError):
+    def __init__(self, location, source, field, available_in):
+        self.details = {'code':'FIELD_SOURCE_MISMATCH','location':location,
+                        'source':source,'field':field,'available_in':sorted(available_in)}
+        super().__init__('Field is unavailable in the selected source')
+
+
+def validate_plan_fields(plan, base_columns):
+    """Infer each relation's output schema without scanning records or executing SQL."""
+    relations = {name:set(fields) for name,fields in base_columns.items()}
+    def require(field, source, location, allow_missing=False):
+        if field in relations[source]:
+            return
+        owners = [name for name,fields in relations.items() if field in fields]
+        # An absent feature field stays UNKNOWN; a field on another relation is a planning error.
+        if allow_missing and not owners:
+            return
+        raise PlanFieldError(location,source,field,owners)
+    def condition(expr, source, location):
+        if expr.op in {'and','or','not'}:
+            for i,arg in enumerate(expr.args):
+                condition(arg,source,f'{location}.args[{i}]')
+        else:
+            require(expr.field,source,location+'.field',allow_missing=True)
+    for i,step in enumerate(plan.steps):
+        prefix = f'steps[{i}]'
+        source = step.source
+        fields = set(relations[source])
+        for j,field in enumerate(step.group_by):
+            require(field,source,f'{prefix}.group_by[{j}]')
+        if step.condition:
+            condition(step.condition,source,prefix+'.condition')
+        for key,expr in step.conditions.items():
+            condition(expr,source,f'{prefix}.conditions.{key}')
+        if step.operator == 'GROUP_AGG':
+            for j,metric in enumerate(step.metrics):
+                require(metric.field,source,f'{prefix}.metrics[{j}].field')
+            fields = set(step.group_by) | {'sample_cnt'} | {m.output for m in step.metrics}
+        elif step.operator == 'CONDITION_COUNT':
+            if set(step.conditions) & fields:
+                raise ValueError('Condition IDs collide with source columns')
+            relations[step.step_id+'_rows'] = fields | set(step.conditions)
+            fields = set(step.group_by) | {'sample_cnt'} | {f'{key}_{suffix}' for key in step.conditions for suffix in ('true','false','unknown')}
+        elif step.operator == 'COMPARE':
+            require(step.compare_field,source,prefix+'.compare_field')
+            fields.add('comparison_diff')
+        elif step.operator == 'TIME_SLICE':
+            require('event_ts',source,prefix+'.source')
+        elif step.operator == 'TEMPORAL_RELATE':
+            for relation in (source,step.other_source):
+                require('event_ts',relation,prefix+'.source')
+                for j,key in enumerate(step.object_keys):
+                    require(key,relation,f'{prefix}.object_keys[{j}]')
+            fields.add('related')
+        relations[step.step_id] = fields
+    return relations
+
+
 def expression_sql(expr, columns, params, depth=0):
     if depth > 12:
         raise ValueError("Expression nesting exceeds 12")
@@ -218,6 +276,7 @@ def execute_plan(directory, scope, plan, output_dir):
     with open_dataset(directory) as (con,meta):
         if (plan.dataset_id,plan.dataset_fingerprint) != (meta["dataset_id"],meta["dataset_fingerprint"]):
             raise ValueError("Plan belongs to another dataset version")
+        validate_plan_fields(plan,scope_columns(con))
         prepare_scope(con,scope,plan_fields(plan))
         for step in plan.steps:
             source = step.source  # validated relation IDs only

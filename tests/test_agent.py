@@ -100,6 +100,56 @@ class AgentTests(unittest.TestCase):
         with self.assertRaises(ServiceError):
             model.embed(["a","b"])
 
+    def test_field_source_feedback_and_confirmed_policy(self):
+        from srs_helper.plans import default_plan
+        parent = self
+        class Model:
+            config = ServiceConfig(provider='local_openai',base_url='http://example',model='test')
+            calls = 0
+            def chat_json(self,messages):
+                self.calls += 1
+                parent.assertIn('不属于 UNCONFIRMED_ARRAY',messages[0].content)
+                if self.calls<=2:
+                    plan = default_plan(parent.normal_meta,'test').model_dump(mode='json')
+                    plan['steps'].append({'step_id':'s2','operator':'COMPARE','source':'stream' if self.calls==1 else 's1',
+                                          'depends_on':[] if self.calls==1 else ['s1'],'compare_field':'gain_avg'})
+                    if self.calls==2:
+                        parent.assertIn('FIELD_SOURCE_MISMATCH',messages[-1].content)
+                        parent.assertIn('s1',messages[-1].content)
+                    return plan
+                return {'claims':[],'hypotheses':[]}
+        engine=DiagnosticEngine(self.root/'agent_fields',self.root/'empty_assets',model=Model())
+        result=engine.run(engine.store.create(self.normal_db),'test')
+        self.assertEqual(result['validation_errors'][0]['details'][0]['code'],'FIELD_SOURCE_MISMATCH')
+        self.assertFalse(any('计划执行失败' in n for n in result['notices']))
+
+    def test_missing_gains_only_reports_missing_without_model_explanation(self):
+        import csv
+        from srs_helper.pipeline import build_dataset
+        from srs_helper.plans import default_plan
+        path=self.root/'empty_gains.csv'
+        with path.open('w',newline='',encoding='utf-8') as stream:
+            writer=csv.writer(stream)
+            writer.writerow(['uwTtiCnt1','logicCellId','crnti','uwData','uwTime']+[f'instBfSinrGain[{i}]' for i in range(4)])
+            writer.writerow([1,0,10,'2026-10-26','00:00:00.000','','','',''])
+        directory,meta=build_dataset(path,self.root/'empty_gain_store',json.loads(Path('config/input_contract.json').read_text()))
+        class Model:
+            config=ServiceConfig(provider='local_openai',base_url='http://example',model='test')
+            calls=0
+            def chat_json(self,messages):
+                self.calls+=1
+                if self.calls>1:
+                    raise AssertionError('No explanation call allowed for missing gains')
+                return default_plan(meta,'test').model_dump(mode='json')
+        model=Model()
+        engine=DiagnosticEngine(self.root/'agent_missing',self.root/'empty_assets',model=model)
+        result=engine.run(engine.store.create(directory),'test')
+        self.assertEqual(model.calls,1)
+        self.assertIn('四流映射已确认',result['answer'])
+        self.assertEqual(result['hypotheses'],[])
+        self.assertEqual(result['claims'],[])
+        self.assertEqual(result['visual']['status'],'NOT_RUN')
+
     def test_feature_extraction_requires_literal_source(self):
         doc = {"path":"features/B.md","version":"hash1","body":"条件只是必要条件。"}
         class Mock:
