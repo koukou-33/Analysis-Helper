@@ -17,6 +17,7 @@ from srs_helper.database import open_dataset, quality_report
 from srs_helper.evidence import verify_artifact
 from srs_helper.knowledge import inspect_image, safe_asset, parse_document
 from srs_helper.pipeline import build_dataset
+from srs_helper.provenance import record_trace
 from srs_helper.queries import Scope
 from srs_helper.sessions import dumps
 from srs_helper.visual import export_chart
@@ -121,7 +122,16 @@ with left:
         st.error("筛选值无效；时间示例：2026-10-22T00:00:00")
         scope_valid,scope = False,Scope()
     feature_docs = [d for d in engine.index.documents() if d["kind"]=="feature"]
-    feature_path = st.selectbox("特性文档（可选）",[None]+[d["path"] for d in feature_docs],format_func=lambda v:v or "仅描述性统计")
+    feature_path = st.selectbox("特性文档（可选）",[None]+[d["path"] for d in feature_docs],format_func=lambda v:v or "自动识别问题相关特性")
+    parents={h['action_id']:h for h in completed if (h.get('feature') or {}).get('cohorts') and h.get('analysis_context')}
+    parent_action_id=st.selectbox('追问来源',[None]+list(parents),format_func=lambda v:'新分析' if v is None else parents[v]['question']+' · '+v[:8])
+    cohort_name=None
+    parent_event_id=None
+    if parent_action_id:
+        labels={'all':'父分析全部业务有效条目','enabled':'父分析实际生效条目','disabled':'父分析实际未生效条目','unknown':'父分析状态未知条目'}
+        cohort_name=st.selectbox('继承的记录群体',list(parents[parent_action_id]['feature']['cohorts']),format_func=lambda v:labels.get(v,v))
+        parent_event_id=st.text_input('具体变化 event_id（可选，填写后仅继承该事件前后记录）',value='') or None
+        st.caption('追问严格继承该记录群体，不自动扩展为相关用户全部记录。范围和规则变化请新建分析。')
     try:
         with st.expander("数据质量与加载清单"):
             report = quality_report(session["dataset_dir"])
@@ -143,13 +153,16 @@ with left:
 def run_question(question, plan_override=None,sql_override=None,peer_comparison=False):
     action_id = str(uuid4())
     st.session_state["pending_action"] = {"sid":sid,"action_id":action_id,"question":question,
-                                          "scope":scope.__dict__,"feature_path":feature_path,"plan_override":plan_override,"sql_override":sql_override,"peer_comparison":peer_comparison}
+                                          "scope":scope.__dict__,"feature_path":feature_path,"plan_override":plan_override,"sql_override":sql_override,"peer_comparison":peer_comparison,"parent_action_id":parent_action_id,"cohort_name":cohort_name,"parent_event_id":parent_event_id}
     try:
         with st.status("正在分析",expanded=True) as status:
-            engine.run(sid,question,scope,action_id,feature_path=feature_path,progress=lambda step:st.write(step),plan_override=plan_override,sql_override=sql_override,peer_comparison=peer_comparison)
-            status.update(label="分析完成",state="complete")
+            completed_result=engine.run(sid,question,scope,action_id,feature_path=feature_path,progress=lambda step:st.write(step),plan_override=plan_override,sql_override=sql_override,peer_comparison=peer_comparison,parent_action_id=parent_action_id,cohort_name=cohort_name,parent_event_id=parent_event_id)
+            complete=completed_result.get("status")=="FACTS_READY"
+            status.update(label="本问题核验完成" if complete else "已保留部分结果，请查看停止原因和缺口",state="complete" if complete else "error")
         st.session_state.pop("pending_action",None)
         st.rerun()
+    except ValueError as exc:
+        st.error(str(exc))
     except Exception:
         st.error("本次操作未完成，已有证据保留。可显式重试。")
 
@@ -166,7 +179,7 @@ with middle:
     if pending and pending["sid"]==sid and st.button("重试上次未完成操作",disabled=not dataset_ok):
         try:
             engine.run(sid,pending["question"],restore_scope(pending["scope"]),pending["action_id"],retry=True,
-                       feature_path=pending["feature_path"],plan_override=pending["plan_override"],sql_override=pending.get("sql_override"),peer_comparison=pending.get("peer_comparison",False))
+                       feature_path=pending["feature_path"],plan_override=pending["plan_override"],sql_override=pending.get("sql_override"),peer_comparison=pending.get("peer_comparison",False),parent_action_id=pending.get("parent_action_id"),cohort_name=pending.get("cohort_name"),parent_event_id=pending.get("parent_event_id"))
             st.session_state.pop("pending_action",None)
             st.rerun()
         except Exception:
@@ -180,7 +193,12 @@ with middle:
             for notice in item["notices"]:
                 st.warning(notice)
             for hypothesis in item.get("hypotheses",[]):
-                st.info("待验证假设："+hypothesis["text"])
+                status=hypothesis.get('status')
+                if status:
+                    st.info({'SUPPORTED':'条件判断获支持','REFUTED':'条件判断被反驳','INCONCLUSIVE':'条件判断未定'}.get(status,status)+'：'+hypothesis['text'])
+                    st.caption(hypothesis.get('interpretation','')+' · '+str(hypothesis.get('counts',{})))
+                else:
+                    st.info('历史结果中的待验证假设（尚未完成自动核验）：'+hypothesis['text'])
                 st.caption("引用："+", ".join(hypothesis["references"]))
             for claim in item.get("claims",[]):
                 st.write("已校验数值",claim)
@@ -288,7 +306,28 @@ with right:
                         st.warning(chart.get("reason","当前没有图表数据。"))
                 st.dataframe(streams,hide_index=True)
         elif panel=="查询证据":
+            st.json(result.get('analysis_context',{}))
+            st.json(result.get('goals',[]))
+            with st.expander('持续验证任务、停止原因及缺口'):
+                st.json(result.get('verification_loop',{}))
             st.json(result["plan"])
+            with st.form('trace_'+sid):
+                trace_id=st.text_input('回查原始记录 record_id')
+                inspect_record=st.form_submit_button('核验并回查原始记录')
+            if inspect_record and trace_id:
+                try:
+                    allowed=False
+                    for evidence in result['artifacts']:
+                        verify_artifact(evidence)
+                        if 'record_id' in pq.ParquetFile(evidence['path']).schema_arrow.names:
+                            for batch in pq.ParquetFile(evidence['path']).iter_batches(columns=['record_id']):
+                                if trace_id in batch.column(0).to_pylist():
+                                    allowed=True; break
+                        if allowed: break
+                    if not allowed: raise ValueError('记录不属于本轮证据')
+                    st.json(record_trace(session['dataset_dir'],trace_id))
+                except (ValueError,OSError):
+                    st.error('记录不属于本轮证据，或原始快照校验失败。')
             for artifact in result["artifacts"]:
                 with st.expander(artifact["operator"]+" · "+artifact["step_id"]):
                     st.caption(f"完整行数 {artifact['row_count']}；预览最多 100 行；SHA256 {artifact['sha256']}")
@@ -325,6 +364,7 @@ with right:
         elif panel=="特性条件":
             if result.get("feature"):
                 st.json(result["feature"])
+                st.json(result.get("session_states",{}))
             else:
                 st.info("选择有效特性文档后分析；未选择时不推断特性生效条件。")
         else:

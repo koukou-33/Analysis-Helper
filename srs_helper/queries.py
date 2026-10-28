@@ -33,6 +33,9 @@ class Scope:
             if value is not None:
                 conditions.append(f"{column} {operator} ?")
                 parameters.append(value)
+        from .provenance import active_cohort
+        if active_cohort.get() is not None:
+            conditions.append('record_id IN (SELECT record_id FROM selected_cohort)')
         return " AND ".join(conditions) or "true", parameters
 
 

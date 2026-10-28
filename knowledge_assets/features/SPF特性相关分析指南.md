@@ -84,6 +84,53 @@ activation_source:
   revision: '1'
   section: 预期生效与实际生效
   excerpt: 预期生效需要以下条件同时成立：srsSpfSwitch=1、isAiranActInd=1、preSinr<=spfPreSinrThd、codeUsrSpfSw=1、preSinrUeCurr<=spfPreSinrThd。
+verification_rules:
+- rule_id: terminal_shape_mismatch
+  cohort: condition_c4_failed
+  quantifier: ANY
+  expression:
+    op: not
+    args:
+    - op: and
+      args:
+      - {op: eq, field: ueLayerNum, value: 4}
+      - op: or
+        args:
+        - {op: eq, field: selLayerNum, value: 1}
+        - {op: eq, field: selLayerNum, value: 2}
+  source:
+    document_id: features/SPF特性相关分析指南.md
+    revision: '1'
+    section: 关键维测信息/codeUsrSpfSw
+    excerpt: codeUsrSpfSw=0可能因终端形态不满足；查询形态只验证共现，不确认其为唯一原因。
+- rule_id: non_serving_observation
+  cohort: condition_c4_failed
+  quantifier: ANY
+  expression: {op: ne, field: compFlag, value: 0}
+  source:
+    document_id: features/SPF特性相关分析指南.md
+    revision: '1'
+    section: 关键维测信息/codeUsrSpfSw
+    excerpt: compFlag不为0表示非服务用户；与未生效共现不单独确认根因。
+- rule_id: screening_disabled_observation
+  cohort: expected_disabled
+  quantifier: ANY
+  expression: {op: eq, field: spfFreqEnFlag, value: 0}
+  source:
+    document_id: features/SPF特性相关分析指南.md
+    revision: '1'
+    section: 已确认的执行口径/预期生效与实际生效
+    excerpt: 筛选阶段标志与生效阶段标志分别核验；差异不直接确认根因。
+- rule_id: final_screening_disabled_observation
+  cohort: expected_disabled
+  quantifier: ANY
+  expression: {op: eq, field: spfFreqCdtEnFlag, value: 0}
+  source:
+    document_id: features/SPF特性相关分析指南.md
+    revision: '1'
+    section: 已确认的执行口径/预期生效与实际生效
+    excerpt: CDT为筛选阶段最终记录；不单凭CDT标志断言实际生效。
+
 ---
 
 SPF是一个基于模型的降噪降干扰特性，在高干扰的场景下能够拿到较为明显的增益，但是在弱覆盖的场景下增益较小。
@@ -124,7 +171,7 @@ spfFreqEnFlag 与 spfFreqCdtEnFlag 属于筛选阶段，codeUsrSpfFlag 属于生
 - CSV 同名重复列逐条记录合并，采用有值的列，不固定选第一列。多个相同非空值合并为一个；不同非空值记录冲突，保留原始列位置和值，不静默选取。
 - 所有 SINR、门限及推理后 RSRP/NI 都无需缩放。compFlag 为实际列名。
 - 沿用统一流控及业务准入规则；推理后 RSRP/NI 的预期范围只是排查参考，暂不新增整行排除门限。
-- 按条目及用户统计，不按频分任务去重。分别统计两个筛选标志及实际生效标志的1/0/未知数量；有效标志比例以0/1条目为分母，另列全部条目数及未知数，避免将未知当作0。
+- 按条目及用户统计，不按频分任务去重。分别统计两个筛选标志及实际生效标志的1/0/未知数量。实际生效比例为 codeUsrSpfFlag=1 的业务有效条目数除以全部业务有效条目数（含 flag 未知）；未生效和未知另列，不能用1减生效比例表示未生效。分母为0时不适用。已知状态内比例如展示必须单独标注，不能替代主指标。
 - 未生效原因可并存，分别展示各条件不满足数量和重叠情况，不推断各原因互斥或因果责任。无法从 codeUsrSpfSw=0 单独拆分终端形态、服务用户、特性互斥三种具体原因。
 - 流增益继续按 ueLayerNum 筛选，selLayerNum 仅用于这里的终端形态条件，不替代流数口径。
 
@@ -135,3 +182,8 @@ A 为特性关闭数据，B 为特性打开数据。本期分别分析两个数�
 ## 当前程序支持边界
 
 本文包含可直接执行的 FeatureSpec，无需模型先提取规则。value_field 表示同一条记录上的右侧字段；每条记录使用自己的门限，不将字段名作为常量，也不取单条门限替代整个数据集。当前结构化规则判断预期生效与实际 codeUsrSpfFlag 的一致性；3D/4D 解释仍须满足正文的生效前提。MML 开关名称 XXX 仍是待补充项，不用于自动推理。
+
+
+### 连续状态分析口径（2026-10-27，已实现相邻观测分析）
+
+用户级只在单个观测会话内分析，不跨会话拼接；人数标为用户观测会话数。状态交替时重点检查转换前后的条件变化，保留原始记录、规则版本和同行门限引用。未知、采样缺口及时间顺序歧义不能被填补成已确认的连续状态或转换。条件变化相符只支持排查解释，不证明根因。条目、会话与转换事件分别统计；用户确认暂不启用用户级原因占比；先展示相邻可排序有效观测，不设自动归因窗口。支持显式记录群体及变化事件追问，不自动扩展到相关用户全部记录。完整契约见详设 §18。

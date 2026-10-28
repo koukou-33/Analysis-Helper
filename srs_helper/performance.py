@@ -56,6 +56,12 @@ def validation_event(stage, attempt, details):
                   'status':'REJECTED', 'diagnostics':details})
 
 
+def service_event(**metadata):
+    """Caller supplies only allowlisted response metadata, never response text."""
+    write_record({'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+                  'trace_id': _trace.get(), 'stage': 'model_response', **metadata})
+
+
 def measured(stage):
     def decorate(function):
         @wraps(function)
@@ -92,6 +98,15 @@ def measured(stage):
                         record.update({k: result[k] for k in ('dataset_id','session_id','action_id') if k in result})
                         record['analysis_status'] = result.get('status')
                         record['backfill_rounds'] = result.get('backfill_rounds',0)
+                        record['goal_count'] = len(result.get('goals',[]))
+                        record['verified_goals'] = sum(g.get('status')=='VERIFIED' for g in result.get('goals',[]))
+                        record['route'] = result.get('route')
+                        loop=result.get('verification_loop',{})
+                        record['verification_stop_reason']=loop.get('stop_reason')
+                        record['verification_queries']=loop.get('round',0)
+                        record['verification_planner_calls']=loop.get('planner_calls',0)
+                        record['verification_gap_count']=len(loop.get('missing_information',[]))
+                        record['model_status'] = result.get('model_status',{})
                         record['requirement_count'] = len(result.get('requirements',[]))
                         record['covered_requirements'] = sum(r.get('status')=='COVERED' for r in result.get('requirements',[]))
                     elif stage in {'query_plan','manual_sql'}:

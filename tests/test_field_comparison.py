@@ -7,12 +7,14 @@ from pathlib import Path
 import duckdb
 
 from srs_helper.plans import Expression, expression_sql, QueryPlan, plan_fields, validate_plan_fields, PlanFieldError
-from srs_helper.evidence import evaluate, feature_analysis
+from srs_helper.evidence import evaluate, feature_analysis, audit_feature_counts
+from srs_helper.reporting import feature_report
+from copy import deepcopy
 from srs_helper.pipeline import build_dataset
 from srs_helper.knowledge import parse_document
 from srs_helper.queries import Scope
 from srs_helper.agent import DiagnosticEngine
-from srs_helper.services import ModelService, ServiceConfig
+from srs_helper.services import ModelService, ServiceConfig, ServiceError
 
 
 class FieldComparisonTests(unittest.TestCase):
@@ -63,6 +65,22 @@ class FieldComparisonTests(unittest.TestCase):
             self.assertEqual(result['activation_states'],{'True':3,'False':4,'None':2})
             self.assertEqual(result['flag_states'],{'True':1,'False':7,'None':1})
             self.assertEqual(result['expected_but_disabled'],1)
+            self.assertEqual(result['actual_metrics']['enabled']['value'],1/9)
+            self.assertEqual(result['validation']['status'],'VERIFIED')
+            self.assertEqual(sum(result['disabled_conditions']['c2'].values()),7)
+            self.assertIn('11.11%',feature_report(result))
+            inconsistent=deepcopy(result)
+            inconsistent['activation_states']['True']=10
+            self.assertIn('AND_UPPER_BOUND_VIOLATION',audit_feature_counts(inconsistent))
+            conflicting=deepcopy(document['metadata'])
+            conflicting['activation_logic']={'op':'eq','field':'c1','value':True}
+            conflicts=feature_analysis(directory,Scope(),meta,conflicting,root/'conflicts')
+            self.assertGreater(conflicts['rule_conflict_count'],0)
+            self.assertEqual(conflicts['status'],'INCONSISTENT')
+            self.assertNotIn('%',feature_report(conflicts))
+            empty=feature_analysis(directory,Scope(crnti=999),meta,document['metadata'],root/'empty')
+            self.assertIsNone(empty['actual_metrics']['enabled']['value'])
+            self.assertIn('不适用',feature_report(empty))
             self.assertTrue(result['complete_activation_rule'])
             self.assertEqual(result['conditions']['c2']['False'],1)
             self.assertEqual(result['conditions']['c3']['None'],3)
@@ -74,6 +92,17 @@ class FieldComparisonTests(unittest.TestCase):
             response=engine.run(engine.store.create(directory),'分析 SPF')
             self.assertEqual(response['feature']['activation_states'],result['activation_states'])
             self.assertEqual(response['feature']['expected_but_disabled'],1)
+            self.assertIn('11.11%',response['answer'])
+            self.assertEqual(response['model_status']['explain'],'NOT_RUN')
+            self.assertEqual(response['status'],'FACTS_READY')
+            class FailedModel:
+                config=ServiceConfig('local_openai','http://test','test')
+                def chat_json(self,messages):
+                    raise ServiceError('empty','CONTENT_EMPTY')
+            failed_engine=DiagnosticEngine(root/'failed_sessions',assets,model=FailedModel())
+            degraded=failed_engine.run(failed_engine.store.create(directory),'分析 SPF')
+            self.assertIn('11.11%',degraded['answer'])
+            self.assertEqual(degraded['model_status'],{'plan':'NOT_REQUIRED_STRUCTURED_FEATURE','explain':'FAILED:CONTENT_EMPTY'})
             bad=dict(document['metadata'],activation_logic={'op':'eq','field':'c1','value_field':'spfPreSinrThd'})
             with self.assertRaisesRegex(ValueError,'evaluated condition IDs'):
                 feature_analysis(directory,Scope(),meta,bad,root/'bad')

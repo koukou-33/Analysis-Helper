@@ -41,7 +41,7 @@ def evaluate(expr, row):
         return None
 
 
-def feature_analysis(directory, scope, meta, feature, output_dir):
+def feature_analysis(directory, scope, meta, feature, output_dir, seconds=30):
     feature = FeatureSpec.model_validate(feature)
     ids = {c.condition_id for c in feature.conditions}
     if len(ids)!=len(feature.conditions) or any(not name.startswith("c") or not name[1:].isdigit() for name in ids):
@@ -51,10 +51,12 @@ def feature_analysis(directory, scope, meta, feature, output_dir):
     plan = QueryPlan(dataset_id=meta["dataset_id"],dataset_fingerprint=meta["dataset_fingerprint"],question=feature.title,
                      required_fields=[feature.flag_field] if feature.flag_field else [],
                      steps=[Step(step_id="s1",operator="CONDITION_COUNT",conditions={c.condition_id:Expression.model_validate(c.expression) for c in feature.conditions})])
-    artifacts = execute_plan(directory,scope,plan,output_dir)
+    artifacts = execute_plan(directory,scope,plan,output_dir,seconds=seconds)
     rows_path = artifacts[0]["path"]
     conditions = {name:Counter() for name in ids}
     flags,expected,overlaps = Counter(),Counter(),Counter()
+    cross_states, disabled_conditions = Counter(), {name:Counter() for name in ids}
+    disabled_coverage=Counter()
     count = should_but_disabled = 0
     complete_rule = feature.activation_logic is not None and feature.activation_source is not None
     if complete_rule:
@@ -75,6 +77,9 @@ def feature_analysis(directory, scope, meta, feature, output_dir):
             enabled = True if actual==feature.enabled_value else False if actual==feature.disabled_value else None
             flags[str(enabled)] += 1
             activation = evaluate(feature.activation_logic,row) if complete_rule else None
+            prevented = any(row[c.condition_id] is True for c in feature.conditions if c.role=="BLOCKING") or any(row[c.condition_id] is False for c in feature.conditions if c.role=="NECESSARY")
+            if complete_rule and activation is True and prevented:
+                rule_conflict_count += 1
             if not complete_rule:
                 sufficient = any(row[c.condition_id] is True for c in feature.conditions if c.role=="SUFFICIENT")
                 prevented = any(row[c.condition_id] is True for c in feature.conditions if c.role=="BLOCKING") or any(row[c.condition_id] is False for c in feature.conditions if c.role=="NECESSARY")
@@ -85,12 +90,62 @@ def feature_analysis(directory, scope, meta, feature, output_dir):
                 elif prevented:
                     activation = False
             expected[str(activation)] += 1
+            cross_states[str(activation)+'|'+str(enabled)] += 1
+            if enabled is False:
+                category='KNOWN_UNMET_CONDITION' if any(row[name] is False for name in ids) else 'MISSING_CONDITIONS' if any(row[name] is None for name in ids) else 'EXPECTED_ACTIVE' if activation is True else 'RULE_OTHER'
+                disabled_coverage[category]+=1
+                for name in ids:
+                    disabled_conditions[name][str(row[name])] += 1
             should_but_disabled += activation is True and enabled is False
-    return {"status":"EVALUATED" if count else "INSUFFICIENT","sample_cnt":count,
+    result = {"status":"EVALUATED" if count else "INSUFFICIENT","sample_cnt":count,
             "conditions":dict(conditions),"condition_overlap":dict(overlaps),"flag_states":dict(flags),
             "activation_states":dict(expected),"expected_but_disabled":should_but_disabled,
+            "expected_actual_cross":dict(cross_states),"disabled_conditions":dict(disabled_conditions),"disabled_condition_coverage":dict(disabled_coverage),
             "complete_activation_rule":complete_rule,"rule_conflict_count":rule_conflict_count,"feature":feature.model_dump(mode="json"),
             "limitations":["必要条件满足不代表应生效；不自动确认根因","条件可能重叠，比例不可直接相加"],"artifacts":artifacts}
+    errors = audit_feature_counts(result)
+    result['validation'] = {'status':'FAILED' if errors else 'VERIFIED', 'errors':errors}
+    if errors:
+        result['status'] = 'INCONSISTENT'
+    result['actual_metrics'] = {name:{'numerator':flags[state], 'denominator':count,
+        'value':flags[state]/count if count else None, 'unit':'ratio', 'analysis_unit':'record',
+        'denominator_definition':'ALL_BUSINESS_VALID_RECORDS',
+        'artifact_ids':[a['artifact_id'] for a in artifacts]}
+        for name,state in [('enabled','True'),('disabled','False'),('unknown','None')]}
+    from .provenance import feature_cohorts
+    result['cohorts'], cohort_artifacts = feature_cohorts(result,artifacts[0],output_dir)
+    result['artifacts'].extend(cohort_artifacts)
+    return result
+
+
+def audit_feature_counts(result):
+    errors=[]
+    count=result['sample_cnt']
+    for key in ('flag_states','activation_states'):
+        if sum(result[key].values()) != count:
+            errors.append(key+'_TOTAL_MISMATCH')
+    for name,counts in result['conditions'].items():
+        if sum(counts.values()) != count:
+            errors.append(name+'_TOTAL_MISMATCH')
+    cross=result['expected_actual_cross']
+    for state in ('True','False','None'):
+        if sum(cross.get(state+'|'+a,0) for a in ('True','False','None')) != result['activation_states'].get(state,0):
+            errors.append('EXPECTED_MARGIN_MISMATCH')
+        if sum(cross.get(a+'|'+state,0) for a in ('True','False','None')) != result['flag_states'].get(state,0):
+            errors.append('ACTUAL_MARGIN_MISMATCH')
+    if cross.get('True|False',0) != result['expected_but_disabled']:
+        errors.append('DISABLED_MISMATCH')
+    for name,counts in result['disabled_conditions'].items():
+        if sum(counts.values()) != result['flag_states'].get('False',0):
+            errors.append(name+'_DISABLED_TOTAL_MISMATCH')
+    rule=result['feature'].get('activation_logic') or {}
+    args=rule.get('args') or []
+    if rule.get('op') == 'and' and args and all(a.get('op') == 'eq' and a.get('value') is True and a.get('field') in result['conditions'] for a in args):
+        if any(result['activation_states'].get('True',0) > result['conditions'][a['field']].get('True',0) for a in args):
+            errors.append('AND_UPPER_BOUND_VIOLATION')
+    if result['rule_conflict_count']:
+        errors.append('ACTIVATION_ROLE_CONFLICT')
+    return sorted(set(errors))
 
 
 def verify_artifact(artifact):

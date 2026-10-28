@@ -52,6 +52,15 @@ class FeatureCondition(BaseModel):
     source: SourceRef
 
 
+class VerificationRule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    rule_id: str
+    cohort: str
+    expression: dict
+    quantifier: Literal["ALL", "ANY"] = "ANY"
+    source: SourceRef
+
+
 class FeatureSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
     feature_id: str
@@ -64,6 +73,7 @@ class FeatureSpec(BaseModel):
     # An explicit full rule is required before making an "expected active" assertion.
     activation_logic: dict | None = None
     activation_source: SourceRef | None = None
+    verification_rules: list[VerificationRule] = Field(default_factory=list)
 
 
 def safe_asset(root, relative):

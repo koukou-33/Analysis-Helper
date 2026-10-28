@@ -29,7 +29,7 @@ class AgentTests(unittest.TestCase):
         aid = str(uuid4())
         first = engine.run(sid,"查看四流增益",Scope(logic_cell_id=0),aid)
         self.assertEqual(first["summary"]["flow_valid_count"],40)
-        self.assertEqual(first["steps"],["retrieve","requirements","plan","execute","coverage","verify","explain"])
+        self.assertEqual(first["steps"],["retrieve","route","requirements","plan","execute","feature","states","coverage","verify","goals","loop_prepare","loop_plan","report","explain","completion_gate","finalize"])
         reopened = DiagnosticEngine(storage,self.root/"empty_assets",model=ModelService(ServiceConfig()))
         same = reopened.run(sid,"查看四流增益",Scope(logic_cell_id=0),aid)
         self.assertEqual(same,first)

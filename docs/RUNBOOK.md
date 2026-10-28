@@ -66,3 +66,59 @@ PNG 导出使用 Kaleido 和本机 Chrome，单图渲染预算 20 秒、独立�
 ## SPF 与重复列升级（2026-10-27）
 
 更新后重新加载 CSV 为 m1.5，创建或选择对应新数据会话。同步知识源，在特性文档中选择“SPF特性相关分析指南”，再询问 SPF 是否生效或未生效原因。程序直接执行文档结构化规则；条件未知和实际标志未知单列，不当作未生效。历史 m1.4 可保留，但没有新重复列合并结果，不宜用于验证这次 SPF 改动。字段间比较写 value_field，不将字段名填成 value。观察 DUPLICATE_VALUE_CONFLICT 时应核查同名非空值冲突，不默认取首列。跨数据集 A/B 比较本期不启用。
+
+
+## 模型空输出和截断诊断（AH-010）
+
+更新重启后按同一问题复验，从 performance.txt 按trace_id查找model_response；purpose区分plan/explain/embedding，error_code、finish_reason、content_type/length、usage和HTTP状态用于定位，不需要提供密钥或原始响应正文。
+
+默认不改变服务端token预算。确认实际端点支持后，LLM_OUTPUT_TOKEN_PARAMETER选择max_tokens或max_completion_tokens，分别设置LLM_PLAN_OUTPUT_TOKENS、LLM_EXPLAIN_OUTPUT_TOKENS；若启用LLM_STRUCTURED_RETRIES=1，LLM_RECOVERY_OUTPUT_TOKENS必须大于首轮预算才会重试。数值需符合实际模型限额，未知时保持默认0。LLM_CALL_BUDGET_SECONDS限制单次chat内HTTP重试和恢复的累计调度时间，不代表全分析硬时限。不要将推理正文当成最终答案。
+
+模型失败仍保留确定性条目报告；model_status与业务status分开。PARTIAL_FACTS_READY可能表示需求尚未识别完整，不等于所有统计失败。生产验证与限制见P0_P1_DELIVERY.md。
+
+
+### 智谱直连 glm-5.3-flash（已核对能力）
+
+官方来源：[模型说明](https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash)、[Chat API](https://docs.bigmodel.cn/api-reference/模型-api/对话补全)。该模型不支持关闭思考；可设置low/high/max推理强度，输出上限参数为max_tokens。本项目提供显式bigmodel_glm53flash能力配置，仅用于https://open.bigmodel.cn/api/paas/v4和glm-5.3-flash，其他端点不自动套用。
+
+本次本地采用以下起始配置，预算并非生产性能保证；降低推理强度后仍需在真实问题上验证规划和解释质量：
+
+```dotenv
+LLM_PROVIDER=openai_compatible
+LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+LLM_MODEL=glm-5.3-flash
+LLM_CAPABILITY_PROFILE=bigmodel_glm53flash
+LLM_REASONING_EFFORT=low
+LLM_OUTPUT_TOKEN_PARAMETER=max_tokens
+LLM_PLAN_OUTPUT_TOKENS=8192
+LLM_EXPLAIN_OUTPUT_TOKENS=8192
+LLM_RECOVERY_OUTPUT_TOKENS=16384
+LLM_STRUCTURED_RETRIES=1
+LLM_TIMEOUT_SECONDS=120
+LLM_CALL_BUDGET_SECONDS=180
+LLM_MAX_RETRIES=0
+```
+
+LLM_API_KEY仅在本地.env填写，不能提交。重启工作台后读取新配置；已有进程环境变量优先于.env。embedding仍需独立可用模型，不用glm-5.3-flash代替向量模型。
+
+最小连通性测试使用4096输出预算、low、无重试，只请求返回ok JSON：成功，finish_reason=stop、content长度12、prompt_tokens=28、completion_tokens=7。该结果仅确认认证与参数组合，不能替代复杂QueryPlan和真实数据解释验证。
+
+
+## 连续追问与原始记录溯源
+
+新版本在左侧提供“追问来源”和“继承的记录群体”，明确继承总体、生效、未生效、未知或某条件失败的记录；范围及版本必须与父分析一致。追问某次变化时填写完整event_id，仅继承前后记录。不从聊天文字猜群体，不自动扩展为相关用户全部记录。查询证据页可按本轮record_id回查并核验快照；用户级原因占比仍未启用。完整步骤、测试及规模限制见[P2～P6开发记录](P2_P6_DELIVERY.md)。
+
+
+## 持续查询验证（2026-10-28）
+
+重启工作台加载新代码及知识源。询问“SPF未生效原因”后，可看到建立任务、规划、追加验证和评估多个阶段；最终答案列出明确谓词获得支持/被反驳/未定，原始模型猜测不会直接作为已验证解释发布。只询问“SPF生效比例”不自动扩展原因。当前为记录谓词循环，保持用户级原因比例暂缓和同侪比较需显式请求的约束。
+
+在查询证据中展开“持续验证任务、停止原因及缺口”，查看validation_tasks、assessments、missing_information、query_ledger、residual_cohorts。LOOP_FIELD_INVENTORY说明字段目录、映射和目标群体缺测/非法值依据；引用可下载完整Parquet。保留action_id、verification_loop和performance.txt用于现场反馈，不需要发送API密钥。
+
+- GOALS_VERIFIED：本问题范围的核验完成，不等于根因或责任已确认。
+- DATA_INSUFFICIENT / CRITERIA_REQUIRED：按缺口清单补字段、映射、有效数值或明确规则。
+- TECHNICAL_FAILURE / BUDGET_EXHAUSTED / NO_PROGRESS：任务未完成，不能解释为数据不存在。模型不能生成任务也不会伪装成业务判据缺失。
+
+追加查询默认最多12次、验证规划最多6次；全部规划/验证/解释模型调用默认合计12次，配置分别为SRS_VERIFY_MAX_QUERIES、SRS_VERIFY_MAX_PLANNER_CALLS、SRS_ANALYSIS_MAX_MODEL_CALLS，范围见.env.example。整体仍受SRS_ANALYSIS_BUDGET_SECONDS限制；重试不重置同一动作预算。已发布的部分结果不可变，调整配置后重新提问创建新动作。进程中断后的“重试上次未完成操作”复用已完成查询。
+
+合成规模复验可运行 `.venv\Scripts\python.exe -m scripts.benchmark_verification --dataset <已有合成数据集目录>`；可加 `--long-table workspace_storage/scope_benchmark/bench.duckdb` 读取已有独立长表基准。该脚本使用离线模拟规划器，不调用真实API，不重新导入数据。现场验证仍应覆盖实际GLM响应及完整大表组合。

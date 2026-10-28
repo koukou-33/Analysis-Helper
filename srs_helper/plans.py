@@ -281,7 +281,7 @@ def scope_columns(con):
 
 
 @measured("prepare_scope")
-def prepare_scope(con,scope,required_fields=()):
+def prepare_scope(con,scope,required_fields=(),include_stream=True):
     where,params = scope.where()
     con.execute(f"CREATE TEMP TABLE resource AS SELECT * EXCLUDE(raw_values) FROM l4_ue_resource_ts WHERE {where}",params)
     existing = {d[0].casefold() for d in con.execute("SELECT * FROM resource LIMIT 0").description}
@@ -297,7 +297,8 @@ def prepare_scope(con,scope,required_fields=()):
                         ' FROM (SELECT e.record_id,e.field_name,e.value FROM l2_extra_numeric e '
                         'SEMI JOIN resource r USING(record_id) WHERE field_name IN ('+placeholders+')) GROUP BY record_id',names+names)
             con.execute('CREATE OR REPLACE TEMP TABLE resource AS SELECT r.*,e.* EXCLUDE(record_id) FROM resource r LEFT JOIN extra_values e USING(record_id)')
-    con.execute("CREATE TEMP TABLE stream AS SELECT s.* EXCLUDE(raw_values) FROM l4_ue_stream_ts s JOIN resource r USING(record_id)")
+    if include_stream:
+        con.execute("CREATE TEMP TABLE stream AS SELECT s.* EXCLUDE(raw_values) FROM l4_ue_stream_ts s JOIN resource r USING(record_id)")
 
 
 @measured("query_plan")
@@ -310,7 +311,8 @@ def execute_plan(directory, scope, plan, output_dir, seconds=30):
             raise ValueError("Plan belongs to another dataset version")
         plan = plan.model_copy(update={"quality_policy": "EXCLUDE_ABNORMAL_RECORD" if meta["rule_version"]in {"m1.4","m1.5"} else "INCLUDE_ALL_NUMERIC"})
         validate_plan_fields(plan,scope_columns(con))
-        prepare_scope(con,scope,plan_fields(plan))
+        prepare_scope(con,scope,plan_fields(plan),include_stream=any(step.source=='stream' or step.other_source=='stream' for step in plan.steps))
+        produced = {}
         for step in plan.steps:
             source = step.source  # validated relation IDs only
             columns = {d[0] for d in con.execute(f'SELECT * FROM "{source}" LIMIT 0').description}
@@ -377,7 +379,9 @@ def execute_plan(directory, scope, plan, output_dir, seconds=30):
             con.execute("EXPLAIN "+sql,parameters)
             con.execute(f'CREATE TEMP TABLE "{step.step_id}" AS '+sql,parameters)
             result = export_relation(con,step.step_id,output_dir,plan,scope,step.operator)
-            result.update(sql=sql,parameters=parameters,purpose=step.purpose)
+            result.update(sql=sql,parameters=parameters,purpose=step.purpose,source_relation=source,
+                          parent_artifact_ids=[produced[name] for name in (source,step.other_source) if name in produced])
+            produced[step.step_id]=result["artifact_id"]
             # Only direct full-scope metrics qualify; filtered/derived relations need separate proof.
             result['metric_evidence'] = [dict(field=m.field,aggregate=m.aggregate,output=m.output,relation=step.source)
                                         for m in step.metrics] if step.operator=='GROUP_AGG' and step.source in {'resource','stream'} else []
@@ -402,7 +406,9 @@ def export_relation(con, name, directory, plan, scope, operator):
             writer.write_batch(batch)
     with path.open("rb") as stream:
         digest = hashlib.file_digest(stream,"sha256").hexdigest()
+    from .provenance import active_cohort_ref
     return {"artifact_id":aid,"path":str(path.resolve()),"sha256":digest,
+            "input_cohort_id":active_cohort_ref.get(),"query_plan":plan.model_dump(mode="json"),
             "dataset_id":plan.dataset_id,"dataset_fingerprint":plan.dataset_fingerprint,"plan_id":plan.plan_id,
             "step_id":name,"operator":operator,"row_count":count,"preview":preview,"preview_truncated":count>100,
             "scope":scope.__dict__,"quality_policy":plan.quality_policy}

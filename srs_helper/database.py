@@ -1,6 +1,7 @@
 """Dataset validation and resource-bounded read connections."""
 from .performance import measured
 import json
+import hashlib
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Timer
@@ -11,8 +12,13 @@ import duckdb
 @contextmanager
 def open_dataset(directory, seconds=30):
     directory = Path(directory)
+    # A short stable path avoids Windows path-length failures when bounded-memory queries spill.
+    # All connections to the same dataset must share DuckDB configuration.
+    spill_root=Path(__file__).resolve().parent.parent/'workspace_storage'/'query_tmp'
+    spill=spill_root/hashlib.sha256(str(directory.resolve()).casefold().encode()).hexdigest()[:24]
+    spill.mkdir(parents=True,exist_ok=True)
     con = duckdb.connect(str(directory / "analysis.duckdb"), read_only=True,
-                         config={"enable_external_access": "false", "memory_limit": "512MB", "threads": "2"})
+                         config={"enable_external_access": "false", "memory_limit": "512MB", "threads": "2", "temp_directory":str(spill)})
     timer = Timer(seconds, con.interrupt)
     timer.daemon = True
     try:
@@ -22,6 +28,10 @@ def open_dataset(directory, seconds=30):
         disk = json.loads((directory / "input_manifest.json").read_text(encoding="utf-8"))
         if meta != disk or meta["status"] not in {"READY", "PARTIAL_READY"} or meta["rule_version"] not in {"m1.2","m1.3","m1.4","m1.5"}:
             raise ValueError("Dataset metadata is incomplete, inconsistent, or unsupported")
+        from .provenance import active_cohort
+        cohort=active_cohort.get()
+        if cohort is not None:
+            con.register('selected_cohort',cohort)
         timer.start()
         yield con, meta
     finally:
