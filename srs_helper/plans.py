@@ -297,6 +297,12 @@ def prepare_scope(con,scope,required_fields=(),include_stream=True):
                         ' FROM (SELECT e.record_id,e.field_name,e.value FROM l2_extra_numeric e '
                         'SEMI JOIN resource r USING(record_id) WHERE field_name IN ('+placeholders+')) GROUP BY record_id',names+names)
             con.execute('CREATE OR REPLACE TEMP TABLE resource AS SELECT r.*,e.* EXCLUDE(record_id) FROM resource r LEFT JOIN extra_values e USING(record_id)')
+    metadata=json.loads(con.execute('SELECT metadata FROM _etl_meta').fetchone()[0])
+    cell_fields=set(metadata.get('contract',{}).get('cell_parameter_policy',{}).get('fields',[]))
+    selected=cell_fields if required_fields is None else cell_fields & set(required_fields)
+    if selected:
+        from .cell_parameters import apply_to_scope
+        apply_to_scope(con,selected)
     if include_stream:
         con.execute("CREATE TEMP TABLE stream AS SELECT s.* EXCLUDE(raw_values) FROM l4_ue_stream_ts s JOIN resource r USING(record_id)")
 
@@ -396,8 +402,18 @@ def export_relation(con, name, directory, plan, scope, operator):
     cursor = con.execute(f'SELECT * FROM "{name}"')
     reader = cursor.fetch_record_batch(2048)
     count,preview = 0,[]
+    inferred_count=0
+    inferred_fields={name:0 for name in reader.schema.names if name.startswith("__cell_fill_")}
     with pq.ParquetWriter(path,reader.schema) as writer:
         for batch in reader:
+            if inferred_fields:
+                import pyarrow.compute as pc
+                mask=None
+                for field_name in inferred_fields:
+                    valid=pc.is_valid(batch.column(field_name))
+                    inferred_fields[field_name]+=pc.sum(pc.cast(valid,"int64")).as_py() or 0
+                    mask=valid if mask is None else pc.or_(mask,valid)
+                inferred_count+=pc.sum(pc.cast(mask,"int64")).as_py() or 0
             count += batch.num_rows
             if count > 1_000_000:
                 raise ValueError("Result exceeds one million rows; narrow the scope")
@@ -408,6 +424,8 @@ def export_relation(con, name, directory, plan, scope, operator):
         digest = hashlib.file_digest(stream,"sha256").hexdigest()
     from .provenance import active_cohort_ref
     return {"artifact_id":aid,"path":str(path.resolve()),"sha256":digest,
+            "imputed_record_count":inferred_count,"imputed_fields":inferred_fields,
+            "cell_parameter_policy":json.loads(con.execute("SELECT metadata FROM _etl_meta").fetchone()[0]).get("contract",{}).get("cell_parameter_policy"),
             "input_cohort_id":active_cohort_ref.get(),"query_plan":plan.model_dump(mode="json"),
             "dataset_id":plan.dataset_id,"dataset_fingerprint":plan.dataset_fingerprint,"plan_id":plan.plan_id,
             "step_id":name,"operator":operator,"row_count":count,"preview":preview,"preview_truncated":count>100,

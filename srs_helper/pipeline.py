@@ -102,6 +102,8 @@ def normalize(row, header, contract, source, file_hash, row_id, dataset_id, posi
 @measured("load_dataset")
 def build_dataset(input_dir, storage, contract):
     contract = dict(contract)
+    from .cell_parameters import snapshot_policy, materialize
+    contract["cell_parameter_policy"] = snapshot_policy(contract)
     if "field_mapping_file" in contract:
         contract["field_mapping"] = json.loads(Path(contract["field_mapping_file"]).read_text(encoding="utf-8"))
     mapping = contract.get("field_mapping", {})
@@ -233,6 +235,7 @@ def build_dataset(input_dir, storage, contract):
                 con.execute("ROLLBACK")
                 entry.update(status="FAILED", error=str(exc), record_near=row_id + 1)
         con.execute(PIPELINE_SQL)
+        materialize(con,contract["cell_parameter_policy"])
         status = "FAILED" if not any(e["status"] == "LOADED" for e in manifest) else (
             "PARTIAL_READY" if any(e["status"] == "FAILED" for e in manifest) else "READY")
         metadata = {"dataset_id": dataset_id, "dataset_fingerprint": fingerprint,

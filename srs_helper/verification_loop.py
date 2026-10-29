@@ -48,6 +48,7 @@ class HypothesisAssessment(Contract):
     counts: dict[str,int] = Field(default_factory=dict)
     evidence_refs: list[str] = Field(default_factory=list)
     residual_cohorts: dict[str,str] = Field(default_factory=dict)
+    imputed_record_count: int = 0
     interpretation: str = '仅验证所列记录条件，不确认因果或责任主体'
 
 class MissingInformation(Contract):
@@ -338,6 +339,9 @@ class VerificationLoop:
         result=HypothesisAssessment(task_id=task.task_id,status=assess_counts(p.quantifier,**counts),
             counts={'total':n,**counts},evidence_refs=task.evidence_refs)
         source=next(a for a in artifacts if a['operator']=='condition_evaluated_rows')
+        result.imputed_record_count=source.get('imputed_record_count',0)
+        if result.imputed_record_count:
+            result.interpretation+='；本判断包含小区参数推定补齐，不能视为全部直接观测'
         partitions={'true':[],'false':[],'unknown':[]}
         for batch in pq.ParquetFile(source['path']).iter_batches(batch_size=2048,columns=['record_id','c0']):
             for r in batch.to_pylist():
@@ -494,6 +498,8 @@ def loop_report(data):
     for a in state.assessments:
         p=tasks[a.task_id].proposal; c=a.counts
         lines.append(f"{labels[a.status]}：群体 {p.cohort} 中{'全部记录' if p.quantifier=='ALL' else '存在记录'}满足 {predicate_label(p.expression)}；满足/不满足/未知为 {c['true']}/{c['false']}/{c['unknown']} 条。")
+        if a.imputed_record_count:
+            lines.append(f'该验证有 {a.imputed_record_count} 条记录使用小区参数推定补齐，来源见完整证据。')
     for m in state.missing_information:
         lines.append('待补充：'+(m.field or m.information_category or '')+'（'+m.cohort+'，'+m.missing_type+
             ('，'+str(m.affected_count)+' 条' if m.affected_count is not None else '')+'）。'+m.supplement)

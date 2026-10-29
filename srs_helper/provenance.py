@@ -143,6 +143,27 @@ def bind_cohort(artifact):
         active_cohort_ref.reset(ref_token)
 
 
+def evidence_contains_record(artifact, record_id):
+    """Allow a row or an explicitly recorded cell-inference source, never arbitrary peers."""
+    from .evidence import verify_artifact
+    verify_artifact(artifact)
+    names=pq.ParquetFile(artifact['path']).schema_arrow.names
+    policy=artifact.get('cell_parameter_policy') or {}
+    fields=['__cell_fill_'+f for f in policy.get('fields',[]) if '__cell_fill_'+f in names]
+    cols=(['record_id'] if 'record_id' in names else [])+fields
+    if not cols:
+        return False
+    for batch in pq.ParquetFile(artifact['path']).iter_batches(batch_size=2048,columns=cols):
+        for row in batch.to_pylist():
+            if row.get('record_id')==record_id:
+                return True
+            for field in fields:
+                source=row.get(field)
+                if isinstance(source,dict) and record_id in (source.get('previous_record_id'),source.get('next_record_id')):
+                    return True
+    return False
+
+
 def record_trace(directory, record_id):
     from .database import open_dataset
     with open_dataset(directory) as (con,meta):

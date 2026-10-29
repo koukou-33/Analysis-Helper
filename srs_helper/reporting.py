@@ -15,6 +15,10 @@ def feature_report(feature):
     if feature.get('validation',{}).get('status') != 'VERIFIED':
         # Do not publish unverified derived values from a failed consistency gate.
         return f"{title} 特性统计未通过一致性校验，暂不发布该部分比例及规则结论。"
+    inference=feature.get('cell_parameter_inference',{})
+    if inference.get('imputed_record_count'):
+        original=inference['original_activation_states']
+        text+=f" 本次条件计算中 {inference['imputed_record_count']} 条记录使用了小区参数推定补齐；以下预期结果包含补齐值。仅按原始观测，预期生效/未生效/未知分别为 {original.get('True',0)}/{original.get('False',0)}/{original.get('None',0)} 条。"
     expected=feature['activation_states']
     text+=f" 规则预期生效 {expected.get('True',0)} 条、预期未生效 {expected.get('False',0)} 条、无法判断 {expected.get('None',0)} 条；预期生效但实际关闭 {feature['expected_but_disabled']} 条。"
     def condition_label(condition):

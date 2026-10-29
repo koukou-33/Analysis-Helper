@@ -86,7 +86,7 @@ class DiagnosticEngine:
         session = self.store.get(sid)
         request = {"question":question,"scope":scope.__dict__,"feature_path":feature_path,"plan_override":plan_override,"sql_override":sql_override,"peer_comparison":peer_comparison,"parent_action_id":parent_action_id,"cohort_name":cohort_name,"parent_event_id":parent_event_id}
         # OS lock survives concurrent Streamlit reruns and is released if the process dies.
-        with portalocker.Lock(str(self.store.directory(sid)/"run.lock"),timeout=0):
+        with self.store.dataset_guard(session["dataset_dir"]), portalocker.Lock(str(self.store.directory(sid)/"run.lock"),timeout=0):
             existing = self.store.begin(sid,action_id,request,retry)
             if existing is not None:
                 return existing
@@ -542,7 +542,7 @@ class DiagnosticEngine:
                 p=tasks[a.task_id].proposal
                 assessments.append({'text':predicate_label(p.expression),'status':a.status,
                     'references':a.evidence_refs,'task_id':a.task_id,'cohort':p.cohort,
-                    'quantifier':p.quantifier,'counts':a.counts,'interpretation':a.interpretation})
+                    'quantifier':p.quantifier,'counts':a.counts,'imputed_record_count':a.imputed_record_count,'interpretation':a.interpretation})
             ephemeral['hypotheses']=assessments
             data=loop.state.model_dump(mode='json')
             goals=[dict(g) for g in state['goals']]

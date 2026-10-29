@@ -27,6 +27,7 @@ class FieldMeta(BaseModel):
     description: str
     unit: str | None = None
     responsibility_layer: Literal["L1内部", "L1测量", "L2", "L3"] | None = None
+    data_level: Literal["小区级", "用户级", "资源级", "流级", "波束级", "记录级", "待确认"] | None = None
     source_version: str | None = None
     source_line: int | None = None
     diagnostic_hint: str | None = None

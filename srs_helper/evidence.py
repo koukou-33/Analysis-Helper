@@ -58,6 +58,8 @@ def feature_analysis(directory, scope, meta, feature, output_dir, seconds=30):
     cross_states, disabled_conditions = Counter(), {name:Counter() for name in ids}
     disabled_coverage=Counter()
     count = should_but_disabled = 0
+    original_conditions={name:Counter() for name in ids}
+    original_expected=Counter()
     complete_rule = feature.activation_logic is not None and feature.activation_source is not None
     if complete_rule:
         rule = Expression.model_validate(feature.activation_logic)
@@ -69,6 +71,14 @@ def feature_analysis(directory, scope, meta, feature, output_dir, seconds=30):
     for batch in pq.ParquetFile(rows_path).iter_batches(batch_size=2048):
         for row in batch.to_pylist():
             count += 1
+            raw=dict(row)
+            for key,value in row.items():
+                if key.startswith('__cell_raw_'):
+                    raw[key[len('__cell_raw_'):]]=value
+            raw_conditions={c.condition_id:evaluate(c.expression,raw) for c in feature.conditions}
+            for name,value in raw_conditions.items():
+                original_conditions[name][str(value)]+=1
+            original_expected[str(evaluate(feature.activation_logic,raw_conditions) if complete_rule else None)]+=1
             for name in ids:
                 conditions[name][str(row[name])] += 1
             failed = sorted(name for name in ids if row[name] is False)
@@ -98,6 +108,10 @@ def feature_analysis(directory, scope, meta, feature, output_dir, seconds=30):
                     disabled_conditions[name][str(row[name])] += 1
             should_but_disabled += activation is True and enabled is False
     result = {"status":"EVALUATED" if count else "INSUFFICIENT","sample_cnt":count,
+            "cell_parameter_inference":{"policy":meta["contract"].get("cell_parameter_policy"),
+                "imputed_record_count":artifacts[0].get("imputed_record_count",0),
+                "imputed_fields":artifacts[0].get("imputed_fields",{}),
+                "original_conditions":dict(original_conditions),"original_activation_states":dict(original_expected)},
             "conditions":dict(conditions),"condition_overlap":dict(overlaps),"flag_states":dict(flags),
             "activation_states":dict(expected),"expected_but_disabled":should_but_disabled,
             "expected_actual_cross":dict(cross_states),"disabled_conditions":dict(disabled_conditions),"disabled_condition_coverage":dict(disabled_coverage),

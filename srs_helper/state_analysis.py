@@ -20,6 +20,7 @@ def state_analysis(directory,scope,feature,source,folder):
         fields.update(v for k,v in expr.items() if k in {'field','value_field'} and isinstance(v,str))
         for arg in expr.get('args',[]): visit(arg)
     for condition in spec['conditions']: visit(condition['expression'])
+    fields.update(n for n in names if n.startswith(('__cell_raw_','__cell_fill_')))
     cols=[c for c in ['record_id','ue_uid','event_ts',flag]+ids+sorted(fields) if c in names]
     table=pq.read_table(source['path'],columns=list(dict.fromkeys(cols)))
     unassigned=sum(v is None for v in table["ue_uid"].to_pylist())
@@ -76,7 +77,7 @@ def state_analysis(directory,scope,feature,source,folder):
                         'before_record_ids':previous['record_ids'],'after_record_ids':record_ids,
                         'before_conditions_json':previous['conditions_json'],'after_conditions_json':obs['conditions_json'],
                         'before_values_json':previous['values_json'],'after_values_json':obs['values_json'],
-                        'changed_conditions':changed,'interpretation':'条件观测变化，待核查' if changed else '已记录条件未见明确变化或存在缺失',
+                        'changed_conditions':changed,'interpretation':'条件值变化（可能含推定补齐，见前后来源），待核查' if changed else '已记录条件未见明确变化或存在缺失',
                         'elapsed_seconds':(ts-previous['event_ts']).total_seconds()})
                     user_events+=1
                 previous=obs if state in {'ENABLED','DISABLED'} else None

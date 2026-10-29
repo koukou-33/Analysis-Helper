@@ -17,7 +17,7 @@ from srs_helper.database import open_dataset, quality_report
 from srs_helper.evidence import verify_artifact
 from srs_helper.knowledge import inspect_image, safe_asset, parse_document
 from srs_helper.pipeline import build_dataset
-from srs_helper.provenance import record_trace
+from srs_helper.provenance import record_trace, evidence_contains_record
 from srs_helper.queries import Scope
 from srs_helper.sessions import dumps
 from srs_helper.visual import export_chart
@@ -55,17 +55,22 @@ with left:
     st.subheader("数据与范围")
     with st.expander("加载 CSV",expanded=False):
         with st.form("load"):
+            dataset_name = st.text_input("数据名称",placeholder="例如：南京站点 SPF 开启 · 10月29日",max_chars=100)
             input_path = st.text_input("目录或单个 CSV 路径",value="workspace_storage/synthetic_v1/normal")
             contract_path = st.selectbox("输入契约",["config/sample_input_contract.json","config/input_contract.json"])
             load = st.form_submit_button("加载新数据版本")
         if load:
             try:
+                name=engine.store.validate_dataset_name(dataset_name) if dataset_name.strip() else Path(input_path).name+" · "+datetime.now().strftime("%m-%d %H:%M")
+                name=engine.store.validate_dataset_name(name)
                 with st.spinner("固定快照并清洗…"):
-                    path,meta = build_dataset(input_path,"workspace_storage/datasets",json.loads(Path(contract_path).read_text(encoding="utf-8")))
+                    path,meta = build_dataset(input_path,engine.store.root/"datasets",json.loads(Path(contract_path).read_text(encoding="utf-8")))
                 if meta["status"]=="FAILED":
                     st.error("所有文件加载失败")
                     st.json(meta["files"])
                 else:
+                    engine.store.name_dataset(path,name)
+                    st.session_state["selected_dataset_path"]=str(Path(path).resolve())
                     sid = engine.store.create(path)
                     st.session_state["active_session"] = sid
                     st.success("数据已加载："+meta["status"])
@@ -74,23 +79,51 @@ with left:
     sessions = engine.store.list()
     if sessions:
         session_ids = [s["id"] for s in sessions]
-        names = {s["id"]:s["title"]+" · "+s["fingerprint"][:8]+" · "+s["accessed"][:19] for s in sessions}
+        names = {s["id"]:engine.store.dataset_name(s["dataset_dir"])+" · "+s["title"]+" · "+s["fingerprint"][:8]+" · "+s["accessed"][:19]+(" · 数据不可用" if not (Path(s["dataset_dir"])/"analysis.duckdb").is_file() else "") for s in sessions}
         current = st.session_state.get("active_session",session_ids[0])
         sid = st.selectbox("历史诊断会话",session_ids,index=session_ids.index(current) if current in session_ids else 0,format_func=lambda v:names[v])
         st.session_state["active_session"] = sid
     else:
         sid = None
-    with st.expander("从已有数据集创建会话"):
-        datasets = sorted(Path("workspace_storage/datasets").glob("*/analysis.duckdb"))
-        choices = [str(p.parent) for p in datasets if not p.parent.name.startswith(".building-")]
-        if choices:
-            selected_dataset = st.selectbox("固定数据版本",choices,format_func=lambda p:Path(p).name[:24])
+    with st.expander("已有数据管理"):
+        datasets=engine.store.datasets()
+        by_path={d['path']:d for d in datasets}
+        if datasets:
+            paths=list(by_path)
+            preferred=st.session_state.get('selected_dataset_path')
+            selected_dataset=st.selectbox('固定数据版本',paths,
+                index=paths.index(preferred) if preferred in paths else 0,
+                format_func=lambda p:by_path[p]['name']+' · '+by_path[p]['dataset_id'][:8])
+            st.session_state['selected_dataset_path']=selected_dataset
+            selected=by_path[selected_dataset]
             if st.button("创建诊断会话"):
                 try:
-                    st.session_state["active_session"] = engine.store.create(selected_dataset)
+                    st.session_state["active_session"]=engine.store.create(selected_dataset)
                     st.rerun()
                 except Exception:
-                    st.error("该数据版本未就绪或不兼容。")
+                    st.error("该数据版本不可用或正在被操作，请稍后重试。")
+            new_name=st.text_input('修改数据名称',value=selected['name'],max_chars=100,key='dataset_name_'+selected['dataset_id'])
+            if st.button('保存数据名称'):
+                try:
+                    engine.store.name_dataset(selected_dataset,new_name)
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception:
+                    st.error('修改失败，数据可能正在被使用。')
+            st.caption(f"关联 {selected['sessions']} 个诊断会话。删除将移除数据库和输入快照，保留历史报告及已生成证据；删除后无法继续查询或回查原始行。原始CSV源文件不会删除。")
+            confirmed=st.checkbox('确认删除此数据集及其输入快照',key='delete_confirm_'+selected['dataset_id'])
+            if st.button('删除数据集',disabled=not confirmed):
+                try:
+                    engine.store.delete_dataset(selected_dataset,expected_dataset_id=selected['dataset_id'])
+                    st.session_state.pop('pending_action',None)
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception:
+                    st.error('删除未完成，数据可能正在分析或被其他程序占用。请释放占用后重试。')
+        else:
+            st.caption('暂无可管理的数据集。')
     st.caption("模型未配置时仍可执行全部确定性统计。")
     if st.button("同步知识源"):
         st.json(engine.index.sync())
@@ -316,14 +349,7 @@ with right:
                 inspect_record=st.form_submit_button('核验并回查原始记录')
             if inspect_record and trace_id:
                 try:
-                    allowed=False
-                    for evidence in result['artifacts']:
-                        verify_artifact(evidence)
-                        if 'record_id' in pq.ParquetFile(evidence['path']).schema_arrow.names:
-                            for batch in pq.ParquetFile(evidence['path']).iter_batches(columns=['record_id']):
-                                if trace_id in batch.column(0).to_pylist():
-                                    allowed=True; break
-                        if allowed: break
+                    allowed=any(evidence_contains_record(evidence,trace_id) for evidence in result['artifacts'])
                     if not allowed: raise ValueError('记录不属于本轮证据')
                     st.json(record_trace(session['dataset_dir'],trace_id))
                 except (ValueError,OSError):
