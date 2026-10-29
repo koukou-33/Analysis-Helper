@@ -112,6 +112,36 @@ class SessionStore:
                 continue
         return result
 
+    def reload_dataset(self, dataset_dir, *, expected_dataset_id, name, contract=None):
+        """Build a new immutable version from verified snapshots; preserve its parent."""
+        from .pipeline import build_dataset
+        name=self.validate_dataset_name(name)
+        path=self.managed_dataset(dataset_dir)
+        with self.dataset_guard(path):
+            with open_dataset(path) as (_,meta):
+                if meta['dataset_id']!=expected_dataset_id:
+                    raise ValueError('数据版本已变化，请刷新后重试。')
+            files={}
+            for entry in meta['files']:
+                if not entry.get('sha256') or not entry.get('source_file'):
+                    raise ValueError('原版本存在未保存的输入快照，请改用原始CSV加载。')
+                if entry['source_file'] in files:
+                    raise ValueError('快照清单存在重复路径。')
+                files[entry['source_file']]=entry['sha256']
+            selected=dict(contract) if contract is not None else dict(meta['contract'])
+            if contract is None:
+                # Preserve parser settings/aliases; refresh cell semantics from current source.
+                selected.pop('field_mapping_file',None)
+            snapshot=path/'snapshot'
+            if snapshot.resolve()!=snapshot.absolute():
+                raise ValueError('快照根目录不能是链接。')
+            new_path,new_meta=build_dataset(snapshot,self.root/'datasets',selected,
+                snapshot_files=files,reload_of={'dataset_id':meta['dataset_id'],
+                    'dataset_fingerprint':meta['dataset_fingerprint'],'source':'VERIFIED_SNAPSHOT'})
+            if new_meta['status']!='FAILED':
+                self.name_dataset(new_path,name)
+            return new_path,new_meta
+
     def delete_dataset(self, dataset_dir, *, expected_dataset_id):
         path=self.managed_dataset(dataset_dir)
         with self.dataset_guard(path):

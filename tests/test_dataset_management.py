@@ -93,3 +93,61 @@ class DatasetManagementTests(unittest.TestCase):
             self.assertFalse(app.exception)
             self.assertFalse(Path(named['path']).exists())
             self.assertTrue(self.source.exists())
+
+    def test_reload_preserves_parent_and_uses_exact_snapshot_manifest(self):
+        before=(self.directory/'input_manifest.json').read_bytes()
+        sid=self.store.create(self.directory)
+        self.source.unlink()
+        (self.directory/'snapshot'/'NR_SRS_10-29_00-00-00.csv').write_text('unrelated')
+        new_path,meta=self.store.reload_dataset(self.directory,
+            expected_dataset_id=self.meta['dataset_id'],name='重新清洗')
+        self.assertNotEqual(new_path,self.directory)
+        self.assertEqual(meta['status'],self.meta['status'])
+        self.assertEqual(meta['files'],self.meta['files'])
+        self.assertEqual(meta['reload_of']['dataset_id'],self.meta['dataset_id'])
+        self.assertEqual(self.store.dataset_name(new_path),'重新清洗')
+        self.assertEqual(self.store.get(sid)['dataset_dir'],str(self.directory.resolve()))
+        self.assertEqual(before,(self.directory/'input_manifest.json').read_bytes())
+
+    def test_reload_rejects_missing_or_tampered_snapshot(self):
+        snapshot=self.directory/'snapshot'/'NR_SRS.csv'
+        snapshot.write_text('tampered')
+        with self.assertRaisesRegex(ValueError,'快照'):
+            self.store.reload_dataset(self.directory,expected_dataset_id=self.meta['dataset_id'],name='新版本')
+        snapshot.unlink()
+        with self.assertRaisesRegex(ValueError,'快照'):
+            self.store.reload_dataset(self.directory,expected_dataset_id=self.meta['dataset_id'],name='新版本')
+        self.assertEqual(len(self.store.datasets()),1)
+
+    def test_reload_checks_identity_and_lock(self):
+        with self.assertRaises(ValueError):
+            self.store.reload_dataset(self.directory,expected_dataset_id='wrong',name='新版本')
+        with self.store.dataset_guard(self.directory):
+            with self.assertRaises(portalocker.exceptions.LockException):
+                self.store.reload_dataset(self.directory,expected_dataset_id=self.meta['dataset_id'],name='新版本')
+
+    def test_reload_refreshes_semantics_and_preserves_parser_settings(self):
+        semantics=self.root/'semantics.md'
+        semantics.write_text('| 字段名称 | 含义 | 归属 | 数据层级 |\n| --- | --- | --- | --- |\n| srsSpfSwitch | 开关 | L2 | 小区级 |\n',encoding='utf-8')
+        contract=dict(self.meta['contract'],field_semantics_file=str(semantics))
+        original,meta=build_dataset(self.source,self.store.root/'datasets',contract)
+        semantics.write_text('| 字段名称 | 含义 | 归属 | 数据层级 |\n| --- | --- | --- | --- |\n| srsSpfSwitch | 开关 | L2 | 记录级 |\n',encoding='utf-8')
+        _,updated=self.store.reload_dataset(original,expected_dataset_id=meta['dataset_id'],name='层级更新')
+        self.assertIn('srsSpfSwitch',meta['contract']['cell_parameter_policy']['fields'])
+        self.assertNotIn('srsSpfSwitch',updated['contract']['cell_parameter_policy']['fields'])
+        self.assertEqual(updated['contract']['date_format'],contract['date_format'])
+
+    def test_ui_reload_selects_new_version_and_session(self):
+        self.store.name_dataset(self.directory,'旧版本')
+        self.store.create(self.directory)
+        with patch('srs_helper.agent.DiagnosticEngine',return_value=self.engine):
+            app=AppTest.from_file('app.py',default_timeout=30).run()
+            next(t for t in app.text_input if t.label=='重新加载后的数据名称').set_value('新规则复验')
+            next(b for b in app.button if b.label=='重新加载数据').click().run()
+            self.assertFalse(app.exception)
+            new=next(d for d in self.store.datasets() if d['name']=='新规则复验')
+            self.assertEqual(next(s for s in app.selectbox if s.label=='固定数据版本').value,new['path'])
+            sid=app.session_state['active_session']
+            self.assertEqual(self.store.get(sid)['dataset_dir'],new['path'])
+            self.assertTrue(self.directory.exists())
+            self.assertEqual(len(self.store.list()),2)

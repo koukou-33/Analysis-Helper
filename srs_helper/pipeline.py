@@ -100,7 +100,7 @@ def normalize(row, header, contract, source, file_hash, row_id, dataset_id, posi
 
 
 @measured("load_dataset")
-def build_dataset(input_dir, storage, contract):
+def build_dataset(input_dir, storage, contract, *, snapshot_files=None, reload_of=None):
     contract = dict(contract)
     from .cell_parameters import snapshot_policy, materialize
     contract["cell_parameter_policy"] = snapshot_policy(contract)
@@ -112,7 +112,21 @@ def build_dataset(input_dir, storage, contract):
     if contract["flow_presence_column"] != "crnti":
         raise ValueError("Flow presence must use raw crnti")
     root, storage = Path(input_dir).resolve(), Path(storage).resolve()
-    paths = [root] if root.is_file() and root.suffix.lower() == ".csv" else sorted(p for p in root.rglob("*") if p.is_file() and is_capture_name(p.name))
+    if snapshot_files is not None:
+        if not root.is_dir() or not snapshot_files:
+            raise ValueError('没有可重新加载的CSV快照。')
+        paths=[]
+        for relative,expected_hash in snapshot_files.items():
+            part=Path(relative)
+            candidate=root/part
+            if (part.is_absolute() or '..' in part.parts or ':' in relative or
+                    candidate.suffix.lower()!='.csv' or not candidate.resolve().is_relative_to(root) or
+                    not candidate.is_file() or not re.fullmatch(r'[0-9a-f]{64}',expected_hash)):
+                raise ValueError('CSV快照缺失或路径无效，请使用原始CSV重新加载。')
+            paths.append(candidate)
+        paths.sort()
+    else:
+        paths = [root] if root.is_file() and root.suffix.lower() == ".csv" else sorted(p for p in root.rglob("*") if p.is_file() and is_capture_name(p.name))
     if root.is_file():
         root = root.parent
     if not paths:
@@ -133,6 +147,8 @@ def build_dataset(input_dir, storage, contract):
                 snapshot.parent.mkdir(parents=True, exist_ok=True)
                 for attempt in range(3):
                     before = digest(path)
+                    if snapshot_files is not None and before!=snapshot_files[source]:
+                        raise ValueError('CSV快照哈希不匹配，拒绝重新加载。')
                     shutil.copyfile(path, snapshot)
                     if before == digest(snapshot) == digest(path):
                         break
@@ -153,6 +169,8 @@ def build_dataset(input_dir, storage, contract):
                         continue
                 seen[key] = (source, snapshot)
             except (OSError, ValueError) as exc:
+                if snapshot_files is not None:
+                    raise ValueError('快照校验或复制失败，拒绝重新加载：'+source) from exc
                 entry.update(status="FAILED", error=str(exc))
         fingerprint = hashlib.sha256(json.dumps(
             {"inputs": manifest, "contract": contract, "rules": RULE_VERSION},
@@ -241,6 +259,8 @@ def build_dataset(input_dir, storage, contract):
         metadata = {"dataset_id": dataset_id, "dataset_fingerprint": fingerprint,
                     "rule_version": RULE_VERSION, "status": status, "files": manifest,
                     "contract": contract, "completed_at": datetime.now().isoformat()}
+        if reload_of is not None:
+            metadata["reload_of"]=reload_of
         manifest_text = json.dumps(metadata, ensure_ascii=False, indent=2)
         con.execute("CREATE TABLE _etl_meta AS SELECT ?::JSON AS metadata", [manifest_text])
         con.close()

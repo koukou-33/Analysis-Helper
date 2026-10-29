@@ -21,6 +21,7 @@ from srs_helper.provenance import record_trace, evidence_contains_record
 from srs_helper.queries import Scope
 from srs_helper.sessions import dumps
 from srs_helper.visual import export_chart
+from srs_helper.canvas import OPERATORS, describe_artifact, expression_text, feature_figures, observation_figure
 
 st.set_page_config(page_title="SRS 诊断工作台",layout="wide")
 st.title("5G NR SRS 诊断工作台")
@@ -29,6 +30,7 @@ st.caption("确定性统计 · 可追溯证据 · 人工审核案例")
 
 @st.cache_resource
 def get_engine():
+    """Dataset management including immutable snapshot reload."""
     return DiagnosticEngine()
 
 
@@ -53,6 +55,12 @@ def quality_style(frame):
 
 with left:
     st.subheader("数据与范围")
+    reload_notice=st.session_state.pop("reload_notice",None)
+    if reload_notice:
+        if st.session_state.pop('reload_partial',False):
+            st.warning(reload_notice+' 部分文件加载失败，请查看数据质量与加载清单。')
+        else:
+            st.success(reload_notice)
     with st.expander("加载 CSV",expanded=False):
         with st.form("load"):
             dataset_name = st.text_input("数据名称",placeholder="例如：南京站点 SPF 开启 · 10月29日",max_chars=100)
@@ -102,6 +110,31 @@ with left:
                     st.rerun()
                 except Exception:
                     st.error("该数据版本不可用或正在被操作，请稍后重试。")
+            st.caption('重新加载将使用该版本保存的CSV快照及当前清洗、小区参数补齐规则生成新版本；旧数据与历史报告保留。不会读取原目录后来新增或修改的文件。')
+            reload_name=st.text_input('重新加载后的数据名称',value=selected['name'][:95]+' · 重载',
+                max_chars=100,key='reload_name_'+selected['dataset_id'])
+            reload_contract=st.selectbox('重新加载输入契约',
+                ['沿用原输入格式与别名','config/sample_input_contract.json','config/input_contract.json'],
+                key='reload_contract_'+selected['dataset_id'])
+            if st.button('重新加载数据'):
+                try:
+                    contract=None if reload_contract=='沿用原输入格式与别名' else json.loads(Path(reload_contract).read_text(encoding='utf-8'))
+                    with st.spinner('正在校验CSV快照并重新清洗，请勿重复操作…'):
+                        new_path,new_meta=engine.store.reload_dataset(selected_dataset,
+                            expected_dataset_id=selected['dataset_id'],name=reload_name,contract=contract)
+                    if new_meta['status']=='FAILED':
+                        st.error('重新加载失败，旧版本已保留。')
+                        st.json(new_meta['files'])
+                    else:
+                        st.session_state['active_session']=engine.store.create(new_path)
+                        st.session_state['selected_dataset_path']=str(new_path.resolve())
+                        st.session_state['reload_notice']='重新加载已生成新版本：'+reload_name+'（'+new_meta['status']+'）。旧版本已保留。'
+                        st.session_state['reload_partial']=new_meta['status']=='PARTIAL_READY'
+                        st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error('重新加载未完成（'+type(exc).__name__+'），旧版本已保留；请检查快照、输入契约或数据占用。')
             new_name=st.text_input('修改数据名称',value=selected['name'],max_chars=100,key='dataset_name_'+selected['dataset_id'])
             if st.button('保存数据名称'):
                 try:
@@ -265,8 +298,28 @@ with right:
     else:
         result = st.selectbox("历史结果",completed,format_func=lambda r:r["question"][:45]+" · "+r["action_id"][:8],index=len(completed)-1)
         st.caption("数据版本："+result["dataset_fingerprint"][:16]+"；当前画布范围："+dumps(result["scope"]))
-        panel = st.radio("视图",["统计与图表","查询证据","特性条件","案例审核"],horizontal=True,key="panel_"+sid)
+        panel = st.selectbox("选择画布内容",["统计与图表","查询证据","特性条件","案例审核"],key="panel_"+sid)
         if panel=="统计与图表":
+            for chart_index,(figure,caption) in enumerate(feature_figures(result.get('feature'))):
+                st.plotly_chart(figure,use_container_width=True,key=f"feature_chart_{result['action_id']}_{chart_index}")
+                st.caption(caption)
+            observations=[a for a in result.get('artifacts',[]) if a.get('operator')=='SESSION_OBSERVATIONS']
+            if observations:
+                with st.expander('状态变化图',expanded=any(word in result['question'] for word in ('变化','切换','趋势','时序'))):
+                    try:
+                        artifact=observations[0]
+                        verify_artifact(artifact)
+                        batch=next(pq.ParquetFile(artifact['path']).iter_batches(batch_size=2000),None)
+                        figure=observation_figure(batch.to_pylist() if batch else [])
+                        if figure is not None:
+                            st.plotly_chart(figure,use_container_width=True,key='observations_'+result['action_id'])
+                            st.caption(f"最多展示前 2000 个观测点，完整证据 {artifact['row_count']} 行。点之间不连线，不推断间隔内持续状态或精确切换时刻。完整结果可在查询证据下载。")
+                        else:
+                            st.info('当前范围没有可绘制的状态观测。')
+                    except (ValueError,OSError):
+                        st.warning('状态观测证据不可用或校验失败，未绘图。')
+            elif any(word in result['question'] for word in ('变化','切换','趋势','时序')):
+                st.info('本次结果没有会话状态观测证据，无法绘制状态变化图。')
             summary = result["summary"]
             st.metric("流控有效记录",summary["flow_valid_count"])
             st.metric("业务准入记录",summary.get("business_valid_count",summary["flow_valid_count"]))
@@ -339,11 +392,14 @@ with right:
                         st.warning(chart.get("reason","当前没有图表数据。"))
                 st.dataframe(streams,hide_index=True)
         elif panel=="查询证据":
-            st.json(result.get('analysis_context',{}))
-            st.json(result.get('goals',[]))
+            with st.expander('分析范围与目标详情'):
+                st.json(result.get('analysis_context',{}))
+                st.json(result.get('goals',[]))
             with st.expander('持续验证任务、停止原因及缺口'):
                 st.json(result.get('verification_loop',{}))
-            st.json(result["plan"])
+            advanced=st.checkbox('显示技术详情与高级查询',value=False,key='advanced_'+sid)
+            if advanced:
+                st.json(result["plan"])
             with st.form('trace_'+sid):
                 trace_id=st.text_input('回查原始记录 record_id')
                 inspect_record=st.form_submit_button('核验并回查原始记录')
@@ -355,10 +411,12 @@ with right:
                 except (ValueError,OSError):
                     st.error('记录不属于本轮证据，或原始快照校验失败。')
             for artifact in result["artifacts"]:
-                with st.expander(artifact["operator"]+" · "+artifact["step_id"]):
+                with st.expander(OPERATORS.get(artifact['operator'],'查询结果')+" · "+artifact["step_id"]):
                     st.caption(f"完整行数 {artifact['row_count']}；预览最多 100 行；SHA256 {artifact['sha256']}")
-                    st.code(artifact.get("sql","内部条件逐记录关系"),language="sql")
-                    st.write("绑定参数",artifact.get("parameters",[]))
+                    st.write(describe_artifact(artifact,result.get('plan')))
+                    if advanced:
+                        st.code(artifact.get("sql","内部条件逐记录关系"),language="sql")
+                        st.write("绑定参数",artifact.get("parameters",[]))
                     try:
                         verify_artifact(artifact)
                         st.dataframe(quality_style(pd.DataFrame(artifact["preview"])),hide_index=True)
@@ -368,29 +426,44 @@ with right:
                     pin_key = "pin_"+artifact["artifact_id"]
                     pinned = st.checkbox("置顶标记（不提升证据等级）",value=engine.store.ui_value(sid,pin_key,False),key=pin_key)
                     engine.store.set_ui_value(sid,pin_key,pinned)
-            with st.form("edit_plan_"+sid):
-                plan_text = st.text_area("修改结构化查询计划（新建证据，不覆盖旧结果）",value=json.dumps(result["plan"],ensure_ascii=False,indent=2),height=220)
-                rerun_plan = st.form_submit_button("执行修改后的计划",disabled=not(scope_valid and dataset_ok))
-            if rerun_plan:
-                try:
-                    plan = json.loads(plan_text)
-                    run_question("手动计划："+result["question"],plan)
-                except ValueError:
-                    st.error("计划 JSON 无效。")
-            with st.form("manual_sql_"+sid):
-                sql_text = st.text_area("受控只读 SQL",value="SELECT logicCellId, AVG(usrRsrp) AS rsrp_avg, COUNT(*) AS sample_cnt FROM resource GROUP BY logicCellId")
-                sql_params = st.text_input("绑定参数（JSON 列表，SQL 中使用 ?）",value="[]")
-                execute_manual = st.form_submit_button("执行探索 SQL",disabled=not(scope_valid and dataset_ok))
-            if execute_manual:
-                try:
-                    run_question("手动 SQL 探索",sql_override={"sql":sql_text,"parameters":json.loads(sql_params)})
-                except ValueError:
-                    st.error("参数 JSON 无效。")
-            st.caption("仅允许当前范围的 resource/stream 和受控 CTE；探索结果不自动确认特性或根因。")
+            if advanced:
+                with st.form("edit_plan_"+sid):
+                    plan_text = st.text_area("修改结构化查询计划（新建证据，不覆盖旧结果）",value=json.dumps(result["plan"],ensure_ascii=False,indent=2),height=220)
+                    rerun_plan = st.form_submit_button("执行修改后的计划",disabled=not(scope_valid and dataset_ok))
+                if rerun_plan:
+                    try:
+                        plan = json.loads(plan_text)
+                        run_question("手动计划："+result["question"],plan)
+                    except ValueError:
+                        st.error("计划 JSON 无效。")
+                with st.form("manual_sql_"+sid):
+                    sql_text = st.text_area("受控只读 SQL",value="SELECT logicCellId, AVG(usrRsrp) AS rsrp_avg, COUNT(*) AS sample_cnt FROM resource GROUP BY logicCellId")
+                    sql_params = st.text_input("绑定参数（JSON 列表，SQL 中使用 ?）",value="[]")
+                    execute_manual = st.form_submit_button("执行探索 SQL",disabled=not(scope_valid and dataset_ok))
+                if execute_manual:
+                    try:
+                        run_question("手动 SQL 探索",sql_override={"sql":sql_text,"parameters":json.loads(sql_params)})
+                    except ValueError:
+                        st.error("参数 JSON 无效。")
+                st.caption("仅允许当前范围的 resource/stream 和受控 CTE；探索结果不自动确认特性或根因。")
         elif panel=="特性条件":
             if result.get("feature"):
-                st.json(result["feature"])
-                st.json(result.get("session_states",{}))
+                feature=result['feature']
+                st.caption('条件不满足仅表示排查线索；多个条件可重叠，不直接确认根因。')
+                if feature.get('validation',{}).get('status')=='VERIFIED':
+                    conditions=[]
+                    for condition in feature.get('feature',{}).get('conditions',[]):
+                        counts=feature.get('conditions',{}).get(condition['condition_id'],{})
+                        conditions.append({'条件':expression_text(condition['expression']),
+                            '满足':counts.get('True',0),'不满足':counts.get('False',0),'未知':counts.get('None',0)})
+                    st.dataframe(pd.DataFrame(conditions),hide_index=True)
+                    if feature.get('cell_parameter_inference',{}).get('imputed_record_count'):
+                        st.caption('部分条件使用小区参数推定补齐，原始值与补齐来源可在证据中回查。')
+                else:
+                    st.warning('条件统计尚未通过一致性校验。')
+                with st.expander('完整特性与会话核验详情'):
+                    st.json(feature)
+                    st.json(result.get("session_states",{}))
             else:
                 st.info("选择有效特性文档后分析；未选择时不推断特性生效条件。")
         else:
