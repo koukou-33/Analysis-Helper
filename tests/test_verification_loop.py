@@ -7,7 +7,7 @@ from unittest.mock import patch
 from uuid import uuid4
 from srs_helper.agent import DiagnosticEngine
 from srs_helper.services import ServiceConfig, ServiceError
-from srs_helper.verification_loop import VerificationLoop, assess_counts, TaskProposal
+from srs_helper.verification_loop import VerificationLoop, assess_counts, TaskProposal, ValidationTask
 from srs_helper.pipeline import build_dataset
 import test_continuous_analysis as fixtures
 
@@ -31,6 +31,77 @@ class ScriptedModel:
 def proposal(field='srsSpfSwitch',value=1,cohort='disabled',quantifier='ALL'):
     return {'goal_id':'disabled_conditions','cohort':cohort,
             'expression':{'op':'eq','field':field,'value':value},'quantifier':quantifier}
+
+
+class LoopBudgetTests(unittest.TestCase):
+    def loop(self, remaining=10):
+        return VerificationLoop(directory='unused',scope=None,meta={},context={},
+            columns={'resource':[]},folder='unused',artifacts=[],feature={},
+            goals=[{'id':'actual_rate','status':'VERIFIED'}],question='SPF 生效比例',
+            remaining=lambda:remaining,persist=lambda data:None)
+
+    def task(self, key='task'):
+        return ValidationTask(task_id=key,proposal=TaskProposal.model_validate(proposal()),
+            fingerprint=key,query_fingerprint=key,context_hash='context')
+
+    def test_completed_planner_does_not_fail_when_time_expires(self):
+        loop=self.loop(0)
+        loop.state.planner_done=True
+        loop.state.stop_reason='GOALS_VERIFIED'
+        loop.propose(lambda payload:self.fail('Completed planner must not be called'))
+        self.assertEqual(loop.state.stop_reason,'GOALS_VERIFIED')
+        self.assertIsNone(loop.state.budget_exhaustion)
+
+    def test_budget_dimensions_and_pending_snapshot(self):
+        for dimension in ('TIME','QUERY_COUNT','PLANNER_CALLS'):
+            with self.subTest(dimension=dimension):
+                loop=self.loop(0 if dimension=='TIME' else 10)
+                if dimension=='QUERY_COUNT': loop.state.round=loop.state.max_queries
+                if dimension=='PLANNER_CALLS':
+                    loop.state.planner_calls=loop.state.max_planner_calls
+                    loop.propose(lambda payload:self.fail('Planner budget exhausted'))
+                else:
+                    loop.state.validation_tasks.append(self.task())
+                    self.assertFalse(loop.can_run())
+                record=loop.state.budget_exhaustion
+                self.assertEqual(record['dimension'],dimension)
+                self.assertEqual(record['remaining_seconds'],0 if dimension=='TIME' else 10)
+                self.assertEqual(record['pending_task_ids'],[] if dimension=='PLANNER_CALLS' else ['task'])
+
+    def test_last_allowed_query_can_be_followed_by_empty_planning(self):
+        loop=self.loop()
+        loop.state.round=loop.state.max_queries
+        loop.propose(lambda payload:{'tasks':[]})
+        loop.finish()
+        self.assertEqual(loop.state.planner_calls,1)
+        self.assertEqual(loop.state.stop_reason,'GOALS_VERIFIED')
+        self.assertIsNone(loop.state.budget_exhaustion)
+
+    def test_cached_query_replays_without_new_query_budget(self):
+        loop=self.loop(0)
+        loop.state.round=loop.state.max_queries
+        task=self.task(); loop.state.validation_tasks.append(task)
+        loop.state.query_ledger[task.query_fingerprint]={'artifacts':['verified_result']}
+        with patch('srs_helper.verification_loop.execute_plan',side_effect=AssertionError('No new query')):
+            loop.execute()
+        self.assertEqual(task.evidence_refs,['verified_result'])
+        self.assertEqual(task.status,'RUNNING')
+        self.assertEqual(loop.state.round,loop.state.max_queries)
+        task.status='SUCCEEDED'
+        loop.state.validation_tasks.append(self.task('new_task'))
+        self.assertFalse(loop.can_run())
+        self.assertEqual(loop.state.budget_exhaustion['dimension'],'TIME')
+        loop.state.stop_reason='USER_STOPPED'; task.status='PENDING'
+        self.assertFalse(loop.can_run())
+
+    def test_model_budget_dimension_is_preserved(self):
+        loop=self.loop()
+        def exhausted(payload):
+            error=ServiceError('Model limit reached',code='BUDGET_EXHAUSTED')
+            error.budget_dimension='MODEL_CALLS'
+            raise error
+        loop.propose(exhausted)
+        self.assertEqual(loop.state.budget_exhaustion['dimension'],'MODEL_CALLS')
 
 
 class VerificationLoopTests(unittest.TestCase):
@@ -101,13 +172,20 @@ class VerificationLoopTests(unittest.TestCase):
         self.assertEqual(result['verification_loop']['stop_reason'],'NO_PROGRESS')
         self.assertEqual(result['status'],'PARTIAL_FACTS_READY')
         self.assertEqual(result['verification_loop']['missing_information'],[])
+        self.assertEqual(model.explain_calls,0)
+        self.assertEqual(result['model_status']['explain'],'NOT_RUN_UNFINISHED_VERIFICATION')
+        self.assertIn('实际生效条目',result['answer'])
 
     def test_service_failure_is_not_data_missing(self):
         def fail(p):
             raise ServiceError('empty content',code='CONTENT_EMPTY')
-        result=self.run_model(ScriptedModel(fail))
+        model=ScriptedModel(fail)
+        result=self.run_model(model)
         self.assertEqual(result['verification_loop']['stop_reason'],'TECHNICAL_FAILURE')
         self.assertEqual(result['verification_loop']['missing_information'],[])
+        self.assertEqual(model.explain_calls,0)
+        self.assertEqual(result['model_status']['explain'],'NOT_RUN_UNFINISHED_VERIFICATION')
+        self.assertIn('实际生效条目',result['answer'])
 
     def test_query_failure_is_not_data_missing(self):
         with patch('srs_helper.verification_loop.execute_plan',side_effect=TimeoutError('query budget')):
@@ -178,11 +256,16 @@ class VerificationLoopTests(unittest.TestCase):
         def limited(loop,**kwargs):
             original(loop,**kwargs)
             loop.remaining=lambda:0
+        model=ScriptedModel(lambda p:{'tasks':[proposal()]})
         with patch.object(VerificationLoop,'__init__',limited):
-            result=self.run_model(ScriptedModel(lambda p:{'tasks':[proposal()]}))
+            result=self.run_model(model)
         self.assertEqual(result['verification_loop']['stop_reason'],'BUDGET_EXHAUSTED')
         self.assertEqual(result['verification_loop']['round'],0)
         self.assertEqual(result['verification_loop']['missing_information'],[])
+        self.assertEqual(model.explain_calls,0)
+        self.assertEqual(result['hypotheses'],[])
+        self.assertEqual(result['model_status']['explain'],'NOT_RUN_UNFINISHED_VERIFICATION')
+        self.assertIn('实际生效条目',result['answer'])
 
     def test_all_null_and_invalid_values_have_distinct_inventory_evidence(self):
         def edit(rows):
@@ -194,6 +277,7 @@ class VerificationLoopTests(unittest.TestCase):
             {'tasks':[proposal('all_null_field',0),proposal('invalid_field',0)]})
         result=self.run_model(model)
         self.assertEqual(result['verification_loop']['stop_reason'],'DATA_INSUFFICIENT')
+        self.assertEqual(model.explain_calls,1)
         gaps={g['field']:g for g in result['verification_loop']['missing_information']}
         self.assertEqual(gaps['all_null_field']['missing_type'],'ALL_NULL')
         self.assertEqual(gaps['invalid_field']['missing_type'],'INVALID_VALUES')
@@ -227,13 +311,15 @@ class VerificationLoopTests(unittest.TestCase):
                     row[10]='0'
                 row.extend(['1','0'])
         self.mutate(edit)
-        result=self.run_model(ScriptedModel())
+        model=ScriptedModel()
+        result=self.run_model(model)
         self.assertEqual(result['verification_loop']['round'],2)
         self.assertEqual([a['status'] for a in result['verification_loop']['assessments']],['REFUTED','REFUTED'])
         gap=next(g for g in result['verification_loop']['missing_information'] if g['cohort']=='unexplained_code_user_switch')
         self.assertEqual(gap['affected_count'],6)
         self.assertEqual(gap['missing_type'],'CRITERION_UNDEFINED')
         self.assertEqual(result['verification_loop']['stop_reason'],'CRITERIA_REQUIRED')
+        self.assertEqual(model.explain_calls,1)
 
     def test_same_query_different_quantifier_reuses_evidence(self):
         def plan(p):

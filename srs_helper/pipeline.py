@@ -103,9 +103,9 @@ def normalize(row, header, contract, source, file_hash, row_id, dataset_id, posi
 def build_dataset(input_dir, storage, contract, *, snapshot_files=None, reload_of=None):
     contract = dict(contract)
     from .cell_parameters import snapshot_policy, materialize
-    contract["cell_parameter_policy"] = snapshot_policy(contract)
     if "field_mapping_file" in contract:
         contract["field_mapping"] = json.loads(Path(contract["field_mapping_file"]).read_text(encoding="utf-8"))
+    contract["cell_parameter_policy"] = snapshot_policy(contract)
     mapping = contract.get("field_mapping", {})
     if mapping.get("stream_count", 4) != 4 or mapping.get("stream_gain_family", "instBfSinrGain") != "instBfSinrGain" or mapping.get("gain_scale", 1.0) != 1.0:
         raise ValueError("Only four instBfSinrGain streams with scale 1 are currently supported")

@@ -396,6 +396,10 @@ with right:
                 st.json(result.get('analysis_context',{}))
                 st.json(result.get('goals',[]))
             with st.expander('持续验证任务、停止原因及缺口'):
+                budget_info=result.get('budget_diagnostics',{})
+                if budget_info:
+                    st.caption(f"整次分析预算 {budget_info['total_seconds']} 秒；进入验证循环时剩余 {budget_info.get('loop_entry_remaining_seconds')} 秒；结束时剩余 {budget_info['remaining_seconds']} 秒。")
+                    st.dataframe(pd.DataFrame([{'阶段':name,'累计耗时（秒）':elapsed} for name,elapsed in budget_info.get('stage_seconds',{}).items()]),hide_index=True)
                 st.json(result.get('verification_loop',{}))
             advanced=st.checkbox('显示技术详情与高级查询',value=False,key='advanced_'+sid)
             if advanced:

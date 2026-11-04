@@ -44,6 +44,11 @@ class ContinuousAnalysisTests(unittest.TestCase):
 
     def test_states_and_complete_lineage(self):
         result=self.engine.run(self.sid,'SPF 用户状态变化原因')
+        diagnostics=result['budget_diagnostics']
+        self.assertLessEqual(diagnostics['remaining_seconds'],diagnostics['loop_entry_remaining_seconds'])
+        self.assertLessEqual(diagnostics['loop_entry_remaining_seconds'],diagnostics['total_seconds'])
+        self.assertTrue({'retrieve','feature','loop_prepare','loop_plan','finalize'}<=set(diagnostics['stage_seconds']))
+        self.assertTrue(all(value>=0 for value in diagnostics['stage_seconds'].values()))
         self.assertEqual(result['route'],'FEATURE')
         self.assertEqual(result['model_status']['plan'],'NOT_REQUIRED_STRUCTURED_FEATURE')
         self.assertEqual(result['session_states']['status'],'VERIFIED')

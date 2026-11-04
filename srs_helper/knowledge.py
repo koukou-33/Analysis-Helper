@@ -1,11 +1,13 @@
 """Versioned Markdown authority, safe image references, rebuildable retrieval."""
 import hashlib
 import json
+import math
 import re
 import shutil
 import sqlite3
 import uuid
-from contextlib import contextmanager
+import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Literal
 
@@ -13,6 +15,10 @@ import yaml
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 from rank_bm25 import BM25Okapi
+
+
+class _SemanticBudgetExceeded(TimeoutError):
+    pass
 
 
 class SourceRef(BaseModel):
@@ -209,7 +215,9 @@ class KnowledgeIndex:
                     latest[key] = doc
         return regular + list(latest.values())
 
-    def search(self, question, limit=3, embedder=None):
+    def search(self, question, limit=3, embedder=None, semantic_seconds=None):
+        if semantic_seconds is not None and (not math.isfinite(semantic_seconds) or semantic_seconds<0):
+            raise ValueError('Semantic retrieval budget must be finite and nonnegative')
         docs = self.documents()
         from .field_metadata import field_chunks
         docs = [chunk for doc in docs for chunk in (field_chunks(doc) if doc['kind']=='field' else [doc])]
@@ -222,53 +230,80 @@ class KnowledgeIndex:
         ranks = {i: 1/(60+r) for r,i in enumerate(ranked,1)}
         mode = "BM25（语义检索未配置）"
         if embedder is not None:
+            from .services import model_budget, ServiceError
+            deadline=time.monotonic()+semantic_seconds if semantic_seconds is not None else None
+            def check_budget():
+                if deadline is not None and time.monotonic()>=deadline:
+                    raise _SemanticBudgetExceeded('Semantic retrieval time budget exhausted')
             try:
-                from qdrant_client import QdrantClient, models
-                signature = hashlib.sha256(embedder.identity.encode()).hexdigest()[:16]
-                vectors = []
-                for doc in docs:
-                    with self.connect() as db:
-                        cached = db.execute("SELECT vector FROM vectors WHERE version=? AND model=?",(doc["version"],signature)).fetchone()
-                    if cached:
-                        vector = json.loads(cached[0])
-                    else:
-                        vector = embedder.embed([doc["body"]+json.dumps(doc["images"],ensure_ascii=False)])[0]
+                check_budget()
+                with model_budget(max(0,deadline-time.monotonic())) if deadline is not None else nullcontext():
+                    from qdrant_client import QdrantClient, models
+                    check_budget()
+                    signature = hashlib.sha256(embedder.identity.encode()).hexdigest()[:16]
+                    vectors = []
+                    for doc in docs:
+                        check_budget()
                         with self.connect() as db:
-                            db.execute("INSERT OR REPLACE INTO vectors VALUES (?,?,?)",(doc["version"],signature,json.dumps(vector)))
-                    vectors.append(vector)
-                query_vector = embedder.embed([question])[0]
-                if any(len(v)!=len(query_vector) for v in vectors):
-                    raise ValueError("Embedding dimension changed; rebuild this model cache")
-                collection = "knowledge_" + signature + "_" + str(len(query_vector))
-                client = QdrantClient(path=str(self.storage / "qdrant"))
-                try:
-                    if not client.collection_exists(collection):
-                        client.create_collection(collection, vectors_config=models.VectorParams(size=len(vectors[0]), distance=models.Distance.COSINE))
-                    points = [models.PointStruct(id=str(uuid.uuid5(uuid.NAMESPACE_URL,d["path"]+d["version"])),vector=v,
-                                                 payload={"path":d["path"],"version":d["version"]}) for d,v in zip(docs,vectors)]
-                    current_ids = {p.id for p in points}
-                    offset = None
-                    stale = []
-                    while True:
-                        page,offset = client.scroll(collection,limit=256,offset=offset,with_payload=False,with_vectors=False)
-                        stale.extend(p.id for p in page if p.id not in current_ids)
-                        if offset is None:
-                            break
-                    if stale:
-                        client.delete(collection,points_selector=models.PointIdsList(points=stale))
-                    existing_ids = {p.id for p in client.retrieve(collection,ids=list(current_ids),with_payload=False,with_vectors=False)}
-                    new_points = [p for p in points if p.id not in existing_ids]
-                    if new_points:
-                        client.upsert(collection,points=new_points)
-                    hits = client.query_points(collection,query=query_vector,limit=max(limit,len(docs))).points
-                    current = {(d["path"],d["version"]):i for i,d in enumerate(docs)}
-                    for rank, hit in enumerate(hits,1):
-                        idx = current.get((hit.payload["path"],hit.payload["version"]))
-                        if idx is not None:
-                            ranks[idx] = ranks.get(idx,0) + 1/(60+rank)
-                    mode = "BM25 + Qdrant（倒数排名融合）"
-                finally:
-                    client.close()
-            except Exception:
-                mode = "BM25（语义检索失败，已降级）"
+                            cached = db.execute("SELECT vector FROM vectors WHERE version=? AND model=?",(doc["version"],signature)).fetchone()
+                        if cached:
+                            vector = json.loads(cached[0])
+                        else:
+                            check_budget()
+                            vector = embedder.embed([doc["body"]+json.dumps(doc["images"],ensure_ascii=False)])[0]
+                            check_budget()
+                            with self.connect() as db:
+                                db.execute("INSERT OR REPLACE INTO vectors VALUES (?,?,?)",(doc["version"],signature,json.dumps(vector)))
+                        vectors.append(vector)
+                    check_budget()
+                    query_vector = embedder.embed([question])[0]
+                    check_budget()
+                    if any(len(v)!=len(query_vector) for v in vectors):
+                        raise ValueError("Embedding dimension changed; rebuild this model cache")
+                    collection = "knowledge_" + signature + "_" + str(len(query_vector))
+                    client = QdrantClient(path=str(self.storage / "qdrant"))
+                    try:
+                        check_budget()
+                        if not client.collection_exists(collection):
+                            check_budget()
+                            client.create_collection(collection, vectors_config=models.VectorParams(size=len(vectors[0]), distance=models.Distance.COSINE))
+                        check_budget()
+                        points = [models.PointStruct(id=str(uuid.uuid5(uuid.NAMESPACE_URL,d["path"]+d["version"])),vector=v,
+                                                     payload={"path":d["path"],"version":d["version"]}) for d,v in zip(docs,vectors)]
+                        current_ids = {p.id for p in points}
+                        offset = None
+                        stale = []
+                        while True:
+                            check_budget()
+                            page,offset = client.scroll(collection,limit=256,offset=offset,with_payload=False,with_vectors=False)
+                            stale.extend(p.id for p in page if p.id not in current_ids)
+                            if offset is None:
+                                break
+                        check_budget()
+                        if stale:
+                            client.delete(collection,points_selector=models.PointIdsList(points=stale))
+                        check_budget()
+                        existing_ids = {p.id for p in client.retrieve(collection,ids=list(current_ids),with_payload=False,with_vectors=False)}
+                        new_points = [p for p in points if p.id not in existing_ids]
+                        check_budget()
+                        if new_points:
+                            client.upsert(collection,points=new_points)
+                        check_budget()
+                        hits = client.query_points(collection,query=query_vector,limit=max(limit,len(docs))).points
+                        check_budget()
+                        fused_ranks=dict(ranks)
+                        current = {(d["path"],d["version"]):i for i,d in enumerate(docs)}
+                        for rank, hit in enumerate(hits,1):
+                            idx = current.get((hit.payload["path"],hit.payload["version"]))
+                            if idx is not None:
+                                fused_ranks[idx] = fused_ranks.get(idx,0) + 1/(60+rank)
+                        check_budget()
+                        mode = "BM25 + Qdrant（倒数排名融合）"
+                    finally:
+                        client.close()
+                    check_budget()
+                    ranks=fused_ranks
+            except Exception as exc:
+                exhausted=isinstance(exc,_SemanticBudgetExceeded) or isinstance(exc,ServiceError) and exc.code=='BUDGET_EXHAUSTED'
+                mode = "BM25（语义检索时间预算耗尽，已降级）" if exhausted else "BM25（语义检索失败，已降级）"
         return [{**docs[i], "retrieval_score":score} for i,score in sorted(ranks.items(),key=lambda pair:pair[1],reverse=True)[:limit]], mode

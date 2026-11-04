@@ -103,6 +103,8 @@ def measured(stage):
                         record['route'] = result.get('route')
                         loop=result.get('verification_loop',{})
                         record['verification_stop_reason']=loop.get('stop_reason')
+                        record['verification_budget_exhaustion']=loop.get('budget_exhaustion')
+                        record['budget_diagnostics']=result.get('budget_diagnostics',{})
                         record['verification_queries']=loop.get('round',0)
                         record['verification_planner_calls']=loop.get('planner_calls',0)
                         record['verification_gap_count']=len(loop.get('missing_information',[]))

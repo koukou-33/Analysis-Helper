@@ -7,6 +7,19 @@ from srs_helper.services import ModelService, ServiceConfig, ServiceError, call_
 
 
 class ServiceDiagnosticsTests(unittest.TestCase):
+    def test_nested_model_budget_never_extends_parent_deadline(self):
+        from srs_helper.services import model_budget, _operation_deadline
+        original=_operation_deadline.get()
+        with patch('srs_helper.services.time.monotonic',return_value=100):
+            with model_budget(10):
+                self.assertEqual(_operation_deadline.get(),110)
+                with model_budget(50):
+                    self.assertEqual(_operation_deadline.get(),110)
+                with model_budget(3):
+                    self.assertEqual(_operation_deadline.get(),103)
+                self.assertEqual(_operation_deadline.get(),110)
+        self.assertEqual(_operation_deadline.get(),original)
+
     def run_response(self, response, **options):
         service = ModelService(ServiceConfig('local_openai','http://test','test', **options),
                                httpx.MockTransport(lambda r:httpx.Response(200,json=response)))

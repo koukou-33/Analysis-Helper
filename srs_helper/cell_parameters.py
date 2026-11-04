@@ -6,10 +6,13 @@ from .field_metadata import compile_mapping
 def snapshot_policy(contract):
     path=Path(contract.get('field_semantics_file') or Path(__file__).resolve().parent.parent/'knowledge_assets/field_mappings/nr_srs_field_mapping.md')
     catalog=compile_mapping(path)
-    return {'version':'cell-continuity.v1','mapping_version':catalog['version'],
-        'fields':sorted(n for n,e in catalog['fields'].items() if e.get('data_level')=='小区级' and not e.get('data_level_conflict')),
+    fields=sorted(n for n,e in catalog['fields'].items() if e.get('data_level')=='小区级' and not e.get('data_level_conflict'))
+    aliases=contract.get('field_mapping',{}).get('aliases',{})
+    return {'version':'cell-continuity.v2','mapping_version':catalog['version'],
+        'fields':fields,'field_aliases':{name:aliases[name] for name in fields if name in aliases},
         'group_by':['logicCellId'],'max_gap_seconds':None,'method':'BRACKET_EQUAL',
-        'source_population':'BUSINESS_VALID_WITHOUT_PARSE_ERRORS','scope':'IMMUTABLE_DATASET'}
+        'source_population':'BUSINESS_VALID_FIELD_VALID','scope':'IMMUTABLE_DATASET',
+        'quality_guard':'IDENTITY_TIME_CSV_STRUCTURE_AND_TARGET_FIELD'}
 
 
 def materialize(con, policy):
@@ -34,11 +37,17 @@ def materialize(con, policy):
             params=[field]
         # Only one selected field is scanned and materialized, never pivot the entire long table.
         extra_bad=' OR e.value NOT IN (0,1)' if field=='srsSpfSwitch' else ''
+        # Core parse failures have already become NULL. They are invalid observations,
+        # not missing values; duplicate conflicts may name the original CSV alias.
+        error_names={field,policy.get('field_aliases',{}).get(field,field)}
+        hard_errors=sorted(name+':'+reason for name in error_names
+                           for reason in ('PARSE_ERROR','NON_FINITE','DUPLICATE_VALUE_CONFLICT'))
         con.execute(f'''CREATE OR REPLACE TEMP TABLE cell_values AS
             SELECT r.record_id,r.logicCellId,r.event_ts,e.value,
-                coalesce(e.bad{extra_bad},false) AS bad
+                (coalesce(e.bad{extra_bad},false) OR NOT r.csv_structure_complete
+                 OR list_has_any(CAST(r.error_reasons AS VARCHAR[]),?)) AS bad
             FROM l4_ue_resource_ts r LEFT JOIN ({values}) e USING(record_id)
-            WHERE r.logicCellId IS NOT NULL AND r.event_ts IS NOT NULL AND NOT r.has_parse_error''',params)
+            WHERE r.logicCellId IS NOT NULL AND r.event_ts IS NOT NULL''',[hard_errors,*params])
         con.execute('''CREATE OR REPLACE TEMP TABLE cell_times AS
             SELECT logicCellId,event_ts,count(DISTINCT value) AS distinct_values,
                 count(value) AS support,min(value) AS value,min(record_id) FILTER(WHERE value IS NOT NULL) AS source_id,

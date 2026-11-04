@@ -79,6 +79,7 @@ class LoopState(Contract):
     max_planner_calls: int = Field(default=6,ge=1,le=6)
     stop_reason: StopReason | None = None
     stop_detail: str = ''
+    budget_exhaustion: dict | None = None
     initialized: bool = False
     planner_done: bool = False
 
@@ -258,11 +259,31 @@ class VerificationLoop:
         self.state.stop_reason=reason; self.state.stop_detail=detail
         self.save()
 
-    def can_run(self):
-        if self.remaining()<=0 or self.state.round>=self.state.max_queries:
-            self.stop('BUDGET_EXHAUSTED','累计时间或验证查询次数耗尽；尚未证明数据不足')
+    def exhaust_budget(self, dimension, detail):
+        self.state.budget_exhaustion={
+            'dimension':dimension, 'remaining_seconds':max(0,self.remaining()),
+            'queries_used':self.state.round, 'queries_limit':self.state.max_queries,
+            'planner_calls_used':self.state.planner_calls, 'planner_calls_limit':self.state.max_planner_calls,
+            'pending_task_ids':[t.task_id for t in self.state.validation_tasks if t.status in {'PENDING','RUNNING'}],
+            'pending_drafts_count':len(self.state.pending_drafts)}
+        self.stop('BUDGET_EXHAUSTED',detail)
+
+    def can_run(self, *, for_planning=False):
+        if self.state.stop_reason in {'TECHNICAL_FAILURE','NO_PROGRESS','USER_STOPPED'}:
             return False
-        return self.state.stop_reason not in {'TECHNICAL_FAILURE','NO_PROGRESS','BUDGET_EXHAUSTED','USER_STOPPED'}
+        task=self.pending()
+        # A completed query can still be evaluated after interruption without a new query allowance.
+        if not for_planning and task and task.query_fingerprint in self.state.query_ledger:
+            return True
+        if self.state.stop_reason=='BUDGET_EXHAUSTED':
+            return False
+        if self.remaining()<=0:
+            self.exhaust_budget('TIME','累计时间预算耗尽；尚未证明数据不足')
+            return False
+        if not for_planning and self.state.round>=self.state.max_queries:
+            self.exhaust_budget('QUERY_COUNT','验证查询次数上限已达到；尚未证明数据不足')
+            return False
+        return True
 
     def execute(self):
         task=self.pending()
@@ -317,8 +338,10 @@ class VerificationLoop:
             self.save()  # Query checkpoint precedes evaluation; retry never repeats this query.
         except Exception as exc:
             task.status='FAILED'; task.error_code=type(exc).__name__
-            self.stop('BUDGET_EXHAUSTED' if self.remaining()<=0 else 'TECHNICAL_FAILURE',
-                      '验证查询未完成：'+type(exc).__name__)
+            if self.remaining()<=0:
+                self.exhaust_budget('TIME','验证查询未完成：'+type(exc).__name__)
+            else:
+                self.stop('TECHNICAL_FAILURE','验证查询未完成：'+type(exc).__name__)
 
     def evaluate(self):
         task=self.pending()
@@ -380,13 +403,16 @@ class VerificationLoop:
             'pending_hypotheses':self.state.pending_drafts,'response_schema':Proposals.model_json_schema()}
 
     def propose(self, callback):
-        if self.pending() or not self.can_run() or self.state.planner_done:
+        if self.pending() or self.state.planner_done or not self.can_run(for_planning=True):
             return
         feedback=None
         # One schema/source repair, charged to the same persistent planning budget.
         for attempt in range(2):
-            if self.state.planner_calls>=self.state.max_planner_calls or self.remaining()<=0:
-                self.stop('BUDGET_EXHAUSTED','验证规划调用或时间预算耗尽；目标尚未完成')
+            if self.remaining()<=0:
+                self.exhaust_budget('TIME','验证规划时间预算耗尽；目标尚未完成')
+                return
+            if self.state.planner_calls>=self.state.max_planner_calls:
+                self.exhaust_budget('PLANNER_CALLS','验证规划调用次数上限已达到；目标尚未完成')
                 return
             self.state.planner_calls+=1; self.save()
             raw=None
@@ -409,7 +435,11 @@ class VerificationLoop:
                 self.save()
                 return
             except ServiceError as exc:
-                self.stop('BUDGET_EXHAUSTED' if exc.code=='BUDGET_EXHAUSTED' else 'TECHNICAL_FAILURE','验证规划失败：'+exc.code)
+                if exc.code=='BUDGET_EXHAUSTED':
+                    self.exhaust_budget(getattr(exc,'budget_dimension',None) or ('TIME' if self.remaining()<=0 else 'MODEL_CALL_OR_SERVICE'),
+                                        '验证规划失败：'+exc.code)
+                else:
+                    self.stop('TECHNICAL_FAILURE','验证规划失败：'+exc.code)
                 return
             except (ValueError,TypeError) as exc:
                 details=exc.errors(include_input=False,include_url=False) if hasattr(exc,'errors') else getattr(exc,'details',str(exc))
@@ -468,7 +498,10 @@ class VerificationLoop:
         if self.state.stop_reason in {'TECHNICAL_FAILURE','BUDGET_EXHAUSTED','NO_PROGRESS','USER_STOPPED'}:
             return
         if self.pending():
-            self.stop('BUDGET_EXHAUSTED' if self.remaining()<=0 else 'NO_PROGRESS','仍有必要验证未执行')
+            if self.remaining()<=0:
+                self.exhaust_budget('TIME','仍有必要验证未执行')
+            else:
+                self.stop('NO_PROGRESS','仍有必要验证未执行')
         elif any(m.required_to_complete and m.missing_type=='CRITERION_UNDEFINED' for m in self.state.missing_information):
             self.stop('CRITERIA_REQUIRED','已有观测事实；进一步解释需要明确判据')
         elif any(m.required_to_complete for m in self.state.missing_information):
@@ -480,7 +513,7 @@ class VerificationLoop:
         elif any(g['status']!='VERIFIED' for g in self.goals):
             reasons={g.get('reason') for g in self.goals}
             if 'BUDGET_EXHAUSTED' in reasons:
-                self.stop('BUDGET_EXHAUSTED','已有需求补查预算耗尽')
+                self.exhaust_budget('UPSTREAM_BACKFILL','已有需求补查预算耗尽')
             elif 'QUERY_FAILED' in reasons or any(g['status']=='FAILED' for g in self.goals):
                 self.stop('TECHNICAL_FAILURE','已有查询或证据校验失败')
             else:

@@ -22,7 +22,9 @@ _operation_deadline = ContextVar('operation_deadline', default=None)
 
 @contextmanager
 def model_budget(seconds):
-    token=_operation_deadline.set(time.monotonic()+max(0,seconds))
+    deadline=time.monotonic()+max(0,seconds)
+    parent=_operation_deadline.get()
+    token=_operation_deadline.set(min(deadline,parent) if parent is not None else deadline)
     try:
         yield
     finally:

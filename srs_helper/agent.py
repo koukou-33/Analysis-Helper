@@ -129,8 +129,11 @@ class DiagnosticEngine:
         journal = json.loads(journal_path.read_text(encoding='utf-8')) if journal_path.exists() else {}
         budget = journal.get("budget") or analysis_budget()
         budget.setdefault('model_calls_limit',int(os.getenv('SRS_ANALYSIS_MAX_MODEL_CALLS','12')))
+        budget.setdefault('semantic_seconds',float(os.getenv('SRS_RETRIEVAL_SEMANTIC_SECONDS','10')))
         if not 1<=budget['model_calls_limit']<=24:
             raise ValueError('Invalid cumulative model call budget')
+        if not 0<=budget['semantic_seconds']<=60:
+            raise ValueError('Invalid semantic retrieval budget')
         def save_progress(**updates):
             journal.update(updates)
             pending = journal_path.with_suffix('.tmp')
@@ -140,10 +143,31 @@ class DiagnosticEngine:
         save_progress(budget_started=operation_started,budget=budget)
         def remaining():
             return max(0,budget['seconds']-(time.time()-operation_started))
+        def budget_diagnostics():
+            return {'total_seconds':budget['seconds'],
+                    'elapsed_seconds':round(max(0,time.time()-operation_started),3),
+                    'remaining_seconds':round(remaining(),3),
+                    'loop_entry_remaining_seconds':journal.get('loop_entry_remaining_seconds'),
+                    'model_calls':journal.get('model_calls',0),
+                    'model_calls_limit':budget['model_calls_limit'],
+                    'semantic_seconds_limit':budget['semantic_seconds'],
+                    'stage_seconds':dict(journal.get('stage_seconds',{}))}
+        def timed_node(name,node):
+            def run(state):
+                started=time.monotonic()
+                try:
+                    return node(state)
+                finally:
+                    stages=dict(journal.get('stage_seconds',{}))
+                    stages[name]=round(stages.get(name,0)+time.monotonic()-started,6)
+                    save_progress(stage_seconds=stages)
+            return measured('agent_'+name)(run)
         def budgeted_model(messages, purpose):
             count=journal.get('model_calls',0)
             if remaining()<=0 or count>=budget['model_calls_limit']:
-                raise ServiceError('累计模型或时间预算耗尽',code='BUDGET_EXHAUSTED')
+                exc=ServiceError('累计模型或时间预算耗尽',code='BUDGET_EXHAUSTED')
+                exc.budget_dimension='TIME' if remaining()<=0 else 'MODEL_CALLS'
+                raise exc
             save_progress(model_calls=count+1)
             return call_model(self.model,messages,purpose)
         ephemeral = {"validation_errors": [], "model_status":{"plan":"NOT_RUN","explain":"NOT_RUN"}}  # full results live in files, not LangGraph checkpoints
@@ -153,7 +177,8 @@ class DiagnosticEngine:
         def retrieve(state):
             announce("检索知识")
             self.index.sync()
-            docs,mode = self.index.search(question,embedder=self.embedder)
+            docs,mode = self.index.search(question,embedder=self.embedder,
+                                          semantic_seconds=min(budget['semantic_seconds'],remaining()))
             refs = [{"path":d["path"],"version":d.get("source_version",d["version"]),"kind":d["kind"],
                      "title":d["metadata"].get("title",d["path"]),"excerpt":d["body"][:1500],
                      "warnings":d["warnings"],"required_metrics":d["metadata"].get("required_metrics",[]),"question_terms":d["metadata"].get("question_terms",[])} for d in docs]
@@ -392,6 +417,8 @@ class DiagnosticEngine:
 
         def loop_prepare(state):
             announce('建立验证任务与残余群体')
+            if 'loop_entry_remaining_seconds' not in journal:
+                save_progress(loop_entry_remaining_seconds=round(remaining(),3))
             loop=VerificationLoop(directory=session['dataset_dir'],scope=scope,meta=meta,context=context,
                 columns=columns,folder=folder,artifacts=ephemeral['artifacts'],feature=ephemeral.get('feature'),
                 goals=state['goals'],question=question,remaining=remaining,
@@ -480,10 +507,14 @@ class DiagnosticEngine:
                 return {'answer':answer,'notices':notices,'steps':state['steps']+['explain']}
             # Free-form model text is never promoted to measured fact. Numeric claims must bind full artifacts.
             feature_consistent = (ephemeral.get('feature') or {}).get('status') != 'INCONSISTENT'
-            if not feature_consistent:
+            unfinished_verification=ephemeral['loop'].state.stop_reason in {'BUDGET_EXHAUSTED','TECHNICAL_FAILURE','NO_PROGRESS'}
+            if unfinished_verification:
+                ephemeral['model_status']['explain']='NOT_RUN_UNFINISHED_VERIFICATION'
+                notices.append('验证尚未完成，跳过可选模型解释；保留已有事实、停止原因及待验证任务。')
+            elif not feature_consistent:
                 ephemeral['model_status']['explain']='BLOCKED_INCONSISTENT_EVIDENCE'
                 notices.append('特性证据一致性校验失败，暂停模型解释，保留独立基础统计。')
-            if feature_consistent and self.model.config.configured and ephemeral["artifacts"] and s["business_valid_count"] and (not state["requirements"] or any(r["status"]=="COVERED" for r in state["requirements"])):
+            if not unfinished_verification and feature_consistent and self.model.config.configured and ephemeral["artifacts"] and s["business_valid_count"] and (not state["requirements"] or any(r["status"]=="COVERED" for r in state["requirements"])):
                 evidence = [{"artifact_id":a["artifact_id"],"row_count":a["row_count"],"preview":a["preview"][:10]} for a in ephemeral["artifacts"]]
                 messages = [SystemMessage(content=EXPLAIN_SYSTEM),
                             HumanMessage(content=dumps({"question":question,"evidence":evidence,"feature_summary":ephemeral.get("feature"),"session_states":ephemeral.get("session_states"),"business_goals":state["goals"],"verification_contract":TaskProposal.model_json_schema(),"verification_state":ephemeral["loop"].planner_payload(),"knowledge":state["refs"],"case_assessments":ephemeral["case_assessments"],"requirements":state["requirements"],"allowed_claim_columns_and_units":UNITS}))]
@@ -518,7 +549,7 @@ class DiagnosticEngine:
                             'evidence_status':requirement['status'],'source':doc['path'],'version':doc['version'],
                             'interpretation':'仅用于排查方向，不确认根因或免责'})
             ephemeral["hypotheses"] = hypotheses
-            ephemeral["visual"] = ({"status":"NOT_RUN","reason":"当前问题没有可用的增益图比对需求或样本。"} if missing_gains or not any(r["field"]=="instBfSinrGain" for r in state["requirements"])
+            ephemeral["visual"] = ({"status":"NOT_RUN","reason":"验证未完成，暂停可选视觉解释。"} if unfinished_verification else {"status":"NOT_RUN","reason":"当前问题没有可用的增益图比对需求或样本。"} if missing_gains or not any(r["field"]=="instBfSinrGain" for r in state["requirements"])
                                   else compare_visual(self.vision,s,ephemeral["documents"],self.index,folder))
             save_progress(explanation_complete=True,claims=ephemeral.get('claims',[]),hypotheses=hypotheses,
                 explain_status=ephemeral['model_status']['explain'],responsibility_evidence=ephemeral['responsibility_evidence'],visual=ephemeral['visual'])
@@ -568,8 +599,8 @@ class DiagnosticEngine:
             ("loop_execute",loop_execute),("loop_evaluate",loop_evaluate),("report",report_node),
             ("explain",explain),("completion_gate",completion_gate),("finalize",finalize)]
         for name,node in nodes:
-            graph.add_node(name,measured('agent_'+name)(node))
-        graph.add_node('rule_plan',measured('agent_rule_plan')(plan_node))
+            graph.add_node(name,timed_node(name,node))
+        graph.add_node('rule_plan',timed_node('rule_plan',plan_node))
         graph.add_edge(START,'retrieve')
         chain=['retrieve','route','requirements']
         for a,b in zip(chain,chain[1:]):
@@ -597,7 +628,7 @@ class DiagnosticEngine:
         result = {"session_id":sid,"action_id":action_id,"question":question,"scope":scope.__dict__,
                   "dataset_id":meta["dataset_id"],"dataset_fingerprint":meta["dataset_fingerprint"],
                   "answer":final["answer"],"notices":final["notices"],"status":final["status"],"model_status":ephemeral["model_status"],
-                  "verification_loop":final["loop_state"],"session_states":ephemeral.get("session_states",{}),"prompt_version":PROMPT_VERSION,"analysis_context":context,"inherited_artifacts":(parent.get("artifacts",[])+([inherited_cohort] if inherited_cohort and inherited_cohort.get("event_id") else [])) if parent else [],"route":final['route'],"goals":final['goals'],
+                  "verification_loop":final["loop_state"],"budget_diagnostics":budget_diagnostics(),"session_states":ephemeral.get("session_states",{}),"prompt_version":PROMPT_VERSION,"analysis_context":context,"inherited_artifacts":(parent.get("artifacts",[])+([inherited_cohort] if inherited_cohort and inherited_cohort.get("event_id") else [])) if parent else [],"route":final['route'],"goals":final['goals'],
                   "feature_binding":({'path':ephemeral['selected_feature']['path'],'version':ephemeral['selected_feature']['version'],
                                       'rule_hash':identity(ephemeral['selected_feature']['metadata'])} if ephemeral.get('selected_feature') else {}),
                   "responsibility_evidence":ephemeral["responsibility_evidence"],"requirements":final["requirements"],"backfill_rounds":final["backfill_rounds"],"validation_errors":ephemeral["validation_errors"],"plan":final["plan"],"steps":final["steps"],"references":final["refs"],"retrieval_mode":final["retrieval_mode"],

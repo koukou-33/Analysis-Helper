@@ -30,3 +30,5 @@
 加载真实数据后分别运行基础统计、单字段及多字段分析，按 `trace_id` 筛选日志，比较各阶段耗时、请求字段数、输出行数和内存。模型与数据库耗时分开查看，不累加嵌套阶段。
 
 校验拒绝额外写入 `plan_validation` / `explanation_validation` 事件（status=REJECTED），包含 attempt 和 diagnostics。解释 diagnostics 为 code 与 location，例如 UNIT_MISMATCH、claims[0].unit。事件不含耗时与内存字段；同一动作的结果 JSON 也保存 validation_errors，可在会话恢复时查看。旧请求无法补写当时未保存的失败原因。
+
+2026-10-30补充：diagnosis新增budget_diagnostics，包含total_seconds、elapsed_seconds、remaining_seconds、loop_entry_remaining_seconds、model_calls/model_calls_limit、semantic_seconds_limit和stage_seconds。verification_budget_exhaustion给出TIME/QUERY_COUNT/PLANNER_CALLS/MODEL_CALLS等耗尽维度及待办计数。stage_seconds只按图节点累计，不重复相加嵌套的query_plan/model_chat；总墙钟还包含重试等待和其他开销。用于区分“循环入场已经没时间”和“循环内耗尽”，不记录原始字段值、提示词或密钥。

@@ -87,7 +87,7 @@ class AgentTests(unittest.TestCase):
                 return {'claims':[],'hypotheses':[{'text':'guess','references':['not_known']}]}
         engine = DiagnosticEngine(self.root/'agent_diagnostics',self.root/'empty_assets',model=RepairModel())
         sid = engine.store.create(self.normal_db)
-        result = engine.run(sid,'test')
+        result = engine.run(sid,'增益')
         self.assertEqual(len(result['validation_errors']),4)
         self.assertEqual(result['validation_errors'][-1]['code'],'UNBOUND_HYPOTHESIS')
         self.assertEqual(result['validation_errors'][-1]['location'],'hypotheses[0].references')

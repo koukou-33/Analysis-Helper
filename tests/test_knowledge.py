@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from srs_helper.knowledge import KnowledgeIndex, parse_document
 
@@ -62,3 +63,58 @@ class KnowledgeTests(unittest.TestCase):
         hits,mode = index.search("增益",embedder=Embedder())
         self.assertIn("Qdrant",mode)
         self.assertEqual(hits[0]["metadata"]["case_id"],"C1")
+
+    def test_zero_semantic_budget_keeps_bm25_without_embedding(self):
+        index=KnowledgeIndex(self.root/'assets',self.root/'index')
+        index.sync()
+        class Unused:
+            identity='unused-model'
+            def embed(self,texts):
+                raise AssertionError('No request with a zero semantic budget')
+        expected,_=index.search('增益')
+        hits,mode=index.search('增益',embedder=Unused(),semantic_seconds=0)
+        self.assertEqual(hits,expected)
+        self.assertIn('时间预算耗尽',mode)
+
+    def test_slow_embedding_stops_before_next_request_and_preserves_bm25(self):
+        index=KnowledgeIndex(self.root/'assets',self.root/'index')
+        index.sync()
+        expected,_=index.search('增益')
+        clock=[100.0]
+        class Slow:
+            identity='synthetic-slow-vector'
+            calls=0
+            def embed(self,texts):
+                self.calls+=1
+                clock[0]+=6
+                return [[1.0,0.0,0.5] for _ in texts]
+        embedder=Slow()
+        with patch('srs_helper.knowledge.time.monotonic',side_effect=lambda:clock[0]):
+            hits,mode=index.search('增益',embedder=embedder,semantic_seconds=5)
+        self.assertEqual(embedder.calls,1)
+        self.assertEqual(hits,expected)
+        self.assertIn('时间预算耗尽',mode)
+
+    def test_service_budget_error_has_specific_fallback_mode(self):
+        from srs_helper.services import ServiceError
+        index=KnowledgeIndex(self.root/'assets',self.root/'index')
+        index.sync()
+        class Expired:
+            identity='expired-model'
+            def embed(self,texts):
+                raise ServiceError('deadline',code='BUDGET_EXHAUSTED')
+        hits,mode=index.search('增益',embedder=Expired(),semantic_seconds=5)
+        self.assertTrue(hits)
+        self.assertIn('时间预算耗尽',mode)
+
+    def test_bounded_semantic_fusion_still_works(self):
+        index=KnowledgeIndex(self.root/'assets',self.root/'index')
+        index.sync()
+        class Fast:
+            identity='fast-model'
+            def embed(self,texts):
+                return [[1.0,0.0,0.5] for _ in texts]
+        with patch('srs_helper.knowledge.time.monotonic',return_value=100.0):
+            hits,mode=index.search('增益',embedder=Fast(),semantic_seconds=5)
+        self.assertTrue(hits)
+        self.assertIn('Qdrant',mode)

@@ -80,3 +80,16 @@ class PerformanceTests(unittest.TestCase):
         row = self.records()[0]
         self.assertEqual((row['input_rows'],row['supplemental_numeric_rows'],row['database_bytes']),(3,6,4))
         self.assertEqual(row['dataset_status'],'PARTIAL_READY')
+
+    def test_diagnosis_logs_budget_origin_and_remaining_time(self):
+        diagnostics={'total_seconds':120,'remaining_seconds':0,'loop_entry_remaining_seconds':3,
+                     'stage_seconds':{'retrieve':55,'feature':60},'model_calls':2,'model_calls_limit':12}
+        exhausted={'dimension':'TIME','remaining_seconds':0}
+        @performance.measured('diagnosis')
+        def diagnose():
+            return {'budget_diagnostics':diagnostics,'verification_loop':{
+                'stop_reason':'BUDGET_EXHAUSTED','budget_exhaustion':exhausted}}
+        diagnose()
+        record=self.records()[0]
+        self.assertEqual(record['budget_diagnostics'],diagnostics)
+        self.assertEqual(record['verification_budget_exhaustion'],exhausted)
