@@ -1,0 +1,6 @@
+{
+  "version": "question-fields.v1",
+  "fields": [
+    {"canonical_field":"taValue","display_name":"TA","aliases":["TA","定时提前量","Timing Advance"],"unit":null,"scale":null,"meaning_status":"RAW_VALUE_ONLY","source":"用户确认TA候选映射，详设§26；单位与缩放待确认"}
+  ]
+}

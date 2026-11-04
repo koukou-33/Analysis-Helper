@@ -30,7 +30,8 @@ from .queries import Scope, summarize
 from .services import ModelService, ServiceConfig, ServiceError, extract_feature, call_model, model_budget
 from .sessions import SessionStore, dumps
 from .sql_executor import execute_sql
-from .charts import time_series_artifact
+from .charts import time_series_artifact, metric_time_series
+from .question_scope import validate_request
 from .provenance import analysis_context, validate_parent, bind_cohort, identity, event_population
 from .prompts import EXPLAIN_SYSTEM, PLAN_SYSTEM, VERIFY_SYSTEM, PROMPT_VERSION, relevant_columns
 from .verification_loop import VerificationLoop, TaskProposal, loop_report, predicate_label
@@ -80,11 +81,14 @@ class DiagnosticEngine:
         self.embedder = embedder or (ModelService(embedding_config) if embedding_config.configured else None)
 
     @measured("diagnosis")
-    def run(self,sid,question,scope=None,action_id=None,retry=False,feature_path=None,progress=None,plan_override=None,sql_override=None,peer_comparison=False,parent_action_id=None,cohort_name=None,parent_event_id=None):
+    def run(self,sid,question,scope=None,action_id=None,retry=False,feature_path=None,progress=None,plan_override=None,sql_override=None,peer_comparison=False,parent_action_id=None,cohort_name=None,parent_event_id=None,confirmed_request=None):
         scope,action_id = scope or Scope(),action_id or str(uuid4())
         scope.where()
         session = self.store.get(sid)
-        request = {"question":question,"scope":scope.__dict__,"feature_path":feature_path,"plan_override":plan_override,"sql_override":sql_override,"peer_comparison":peer_comparison,"parent_action_id":parent_action_id,"cohort_name":cohort_name,"parent_event_id":parent_event_id}
+        if confirmed_request:
+            with open_dataset(session["dataset_dir"]) as (_,meta):
+                validate_request(confirmed_request,meta,question,scope,check_mapping=not retry)
+        request = {"confirmed_request":confirmed_request,"question":question,"scope":scope.__dict__,"feature_path":feature_path,"plan_override":plan_override,"sql_override":sql_override,"peer_comparison":peer_comparison,"parent_action_id":parent_action_id,"cohort_name":cohort_name,"parent_event_id":parent_event_id}
         # OS lock survives concurrent Streamlit reruns and is released if the process dies.
         with self.store.dataset_guard(session["dataset_dir"]), portalocker.Lock(str(self.store.directory(sid)/"run.lock"),timeout=0):
             existing = self.store.begin(sid,action_id,request,retry)
@@ -107,13 +111,14 @@ class DiagnosticEngine:
                 elif cohort_name or parent_event_id or any(w in question for w in ('这些用户','这些记录','这些变化','这些会话')):
                     raise ValueError('请明确选择追问来源和群体，不能从聊天文字猜测这些对象。')
                 with bind_cohort(cohort):
-                    return self._run(session,question,scope,action_id,feature_path,progress,plan_override,sql_override,peer_comparison,parent,cohort)
+                    return self._run(session,question,scope,action_id,feature_path,progress,plan_override,sql_override,peer_comparison,parent,cohort,confirmed_request)
             except Exception:
                 self.store.fail(sid,action_id)
                 raise
 
-    def _run(self,session,question,scope,action_id,feature_path,progress,plan_override,sql_override,peer_comparison,parent=None,inherited_cohort=None):
+    def _run(self,session,question,scope,action_id,feature_path,progress,plan_override,sql_override,peer_comparison,parent=None,inherited_cohort=None,confirmed_request=None):
         sid = session["id"]
+        query_question=question+" "+" ".join(m["canonical_field"] for m in (confirmed_request or {}).get("metrics",[]))
         with open_dataset(session["dataset_dir"]) as (con,meta):
             if (meta["dataset_id"],meta["dataset_fingerprint"]) != (session["dataset_id"],session["fingerprint"]):
                 raise ValueError("Session dataset version no longer matches")
@@ -122,6 +127,7 @@ class DiagnosticEngine:
             columns = scope_columns(con)
         context=analysis_context(meta,scope,action_id,parent.get('action_id') if parent else None,
                                  inherited_cohort['artifact_id'] if inherited_cohort else None)
+        context['confirmed_request_hash']=(confirmed_request or {}).get('request_hash')
         context['parent_event_id']=inherited_cohort.get('event_id') if inherited_cohort else None
         folder = self.store.directory(sid)/"artifacts"
         folder.mkdir(parents=True,exist_ok=True)
@@ -151,16 +157,22 @@ class DiagnosticEngine:
                     'model_calls':journal.get('model_calls',0),
                     'model_calls_limit':budget['model_calls_limit'],
                     'semantic_seconds_limit':budget['semantic_seconds'],
-                    'stage_seconds':dict(journal.get('stage_seconds',{}))}
+                    'stage_seconds':dict(journal.get('stage_seconds',{})),
+                    'stage_status':dict(journal.get('stage_status',{}))}
         def timed_node(name,node):
             def run(state):
-                started=time.monotonic()
+                started=time.monotonic(); status="完成"
                 try:
                     return node(state)
+                except BaseException:
+                    status="失败"
+                    raise
                 finally:
                     stages=dict(journal.get('stage_seconds',{}))
                     stages[name]=round(stages.get(name,0)+time.monotonic()-started,6)
-                    save_progress(stage_seconds=stages)
+                    statuses=dict(journal.get("stage_status",{})); statuses[name]=status
+                    save_progress(stage_seconds=stages,stage_status=statuses)
+                    if progress: progress(f"{name}：{status}（{stages[name]:.2f}秒累计）")
             return measured('agent_'+name)(run)
         def budgeted_model(messages, purpose):
             count=journal.get('model_calls',0)
@@ -202,13 +214,18 @@ class DiagnosticEngine:
                 doc=None
             ephemeral['selected_feature']=doc
             context['feature_rule_hash']=identity(doc['metadata']) if doc else None
-            route='FEATURE' if doc and not doc['metadata'].get('unstructured') and plan_override is None and sql_override is None else 'DESCRIPTIVE' if question_requirements(question,columns,state['refs']) else 'EXPLORATION'
+            route='FEATURE' if doc and not doc['metadata'].get('unstructured') and plan_override is None and sql_override is None else 'DESCRIPTIVE' if question_requirements(query_question,columns,state['refs']) else 'EXPLORATION'
             return {'route':route,'steps':state['steps']+['route']}
 
         def requirements_node(state):
             announce("整理问题需求")
             with open_dataset(session['dataset_dir']) as (con,_):
-                requirements = inventory_requirements(con,meta,question_requirements(question,columns,state['refs']))
+                requirements=question_requirements(query_question,columns,state['refs'])
+                for metric in (confirmed_request or {}).get('metrics',[]):
+                    field=metric['canonical_field']
+                    if not any(r['field']==field for r in requirements):
+                        requirements.append({'id':'metric_'+str(len(requirements)),'field':field,'purpose':'CONFIRMED_TREND','source':'CONFIRMED_REQUEST','source_excerpt':question,'status':'NOT_QUERIED','relation':'resource','artifacts':[],'valid_count':None})
+                requirements=inventory_requirements(con,meta,requirements)
             return {'requirements':requirements,
                     'backfill_rounds':journal.get('rounds',0),'budget_started':operation_started,'steps':state['steps']+['requirements']}
         def plan_node(state):
@@ -222,6 +239,12 @@ class DiagnosticEngine:
             if plan_override is not None:
                 plan = QueryPlan.model_validate(plan_override)
                 validate_plan_fields(plan,columns)
+            elif confirmed_request and confirmed_request["trend"] and confirmed_request["metrics"]:
+                from .plans import Step, Metric
+                field=confirmed_request["metrics"][0]["canonical_field"]
+                if field in columns["resource"]:
+                    plan=QueryPlan(dataset_id=meta["dataset_id"],dataset_fingerprint=meta["dataset_fingerprint"],question=question,steps=[Step(step_id="s1",operator="GROUP_AGG",group_by=["logicCellId","ue_uid"],metrics=[Metric(field=field,aggregate=agg,output=agg+"_value") for agg in ("count","avg","min","max")])])
+                    ephemeral["model_status"]["plan"]="NOT_REQUIRED_CONFIRMED_TREND"
             elif state.get('route')=='FEATURE':
                 ephemeral['model_status']['plan']='NOT_REQUIRED_STRUCTURED_FEATURE'
             elif self.model.config.configured and sql_override is None:
@@ -282,6 +305,12 @@ class DiagnosticEngine:
                     artifact["origin"] = "QUERY"
             except Exception as exc:
                 notices.append("计划执行失败（"+type(exc).__name__+"）；保留基础统计，可修改计划重试。")
+            if confirmed_request and confirmed_request["trend"]:
+                for metric in confirmed_request["metrics"]:
+                    try:
+                        artifacts.append(metric_time_series(session["dataset_dir"],scope,folder,metric["canonical_field"]))
+                    except Exception as exc:
+                        notices.append("指标时序未完成："+metric["canonical_field"]+"（"+type(exc).__name__+"），检查字段可用性及查询限制。")
             try:
                 if any(r["field"] in {"usrRsrp","srsUeNiDb"} for r in state["requirements"]):
                     artifacts.append(time_series_artifact(session["dataset_dir"],scope,folder))
@@ -477,6 +506,10 @@ class DiagnosticEngine:
             answer = (f"当前范围包含 {s['flow_valid_count']} 条流控有效记录，其中 {s['session_assigned_count']} 条可归属观测会话。"
                       f"RSRP / NI 有效样本分别为 {s['rsrp_valid_count']} / {s['ni_valid_count']}。"
                       +(f"其中 {s['business_valid_count']} 条参与业务统计；可疑及非法流数记录整行排除。" if s["quality_policy"]=="EXCLUDE_ABNORMAL_RECORD" else "历史数据采用旧口径，包含可疑值；请重新加载以应用新规则。")+"各流均值独立统计，使用有限值算术均值。")
+            for a in ephemeral["artifacts"]:
+                if a["operator"]=="METRIC_TIME_SERIES":
+                    t=a["statistics"]
+                    answer+=f"\n{a['field']}：完整范围共 {t['points']} 个观测时点，{t['valid_points']} 个时点有唯一有效值；最小/最大值 {t['minimum']} / {t['maximum']}。时间覆盖 {t['start']} 至 {t['end']}。使用原始数值，不推断距离或持续变化；分小区与会话查看折线图。"
             if not s["flow_valid_count"]:
                 answer += " 当前范围无数据，不能据此确认或排除根因。"
             missing_gains = gains_missing(s)
@@ -625,7 +658,7 @@ class DiagnosticEngine:
                                     {"configurable":{"thread_id":sid},"recursion_limit":96})
         finally:
             connection.close()
-        result = {"session_id":sid,"action_id":action_id,"question":question,"scope":scope.__dict__,
+        result = {"confirmed_request":confirmed_request,"session_id":sid,"action_id":action_id,"question":question,"scope":scope.__dict__,
                   "dataset_id":meta["dataset_id"],"dataset_fingerprint":meta["dataset_fingerprint"],
                   "answer":final["answer"],"notices":final["notices"],"status":final["status"],"model_status":ephemeral["model_status"],
                   "verification_loop":final["loop_state"],"budget_diagnostics":budget_diagnostics(),"session_states":ephemeral.get("session_states",{}),"prompt_version":PROMPT_VERSION,"analysis_context":context,"inherited_artifacts":(parent.get("artifacts",[])+([inherited_cohort] if inherited_cohort and inherited_cohort.get("event_id") else [])) if parent else [],"route":final['route'],"goals":final['goals'],
@@ -634,5 +667,7 @@ class DiagnosticEngine:
                   "responsibility_evidence":ephemeral["responsibility_evidence"],"requirements":final["requirements"],"backfill_rounds":final["backfill_rounds"],"validation_errors":ephemeral["validation_errors"],"plan":final["plan"],"steps":final["steps"],"references":final["refs"],"retrieval_mode":final["retrieval_mode"],
                   "case_assessments":ephemeral["case_assessments"],"peers":ephemeral["peers"],"summary":ephemeral["summary"],"artifacts":ephemeral["artifacts"],"feature":ephemeral["feature"],
                   "hypotheses":ephemeral["hypotheses"],"claims":ephemeral.get("claims",[]),"visual":ephemeral["visual"]}
+        for artifact in result["artifacts"]:
+            if confirmed_request: artifact["confirmed_request_hash"]=confirmed_request["request_hash"]
         self.store.finish(sid,action_id,result)
         return json.loads(dumps(result))

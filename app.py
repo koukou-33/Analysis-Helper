@@ -20,6 +20,7 @@ from srs_helper.pipeline import build_dataset
 from srs_helper.provenance import record_trace, evidence_contains_record
 from srs_helper.queries import Scope
 from srs_helper.sessions import dumps
+from srs_helper.question_scope import parse_question, confirm_request, scope_dict, identity as request_identity, mapping as question_mapping
 from srs_helper.visual import export_chart
 from srs_helper.canvas import OPERATORS, describe_artifact, expression_text, feature_figures, observation_figure
 
@@ -216,13 +217,14 @@ with left:
         st.error("会话数据集不可用；仍可查看已保存历史。")
 
 
-def run_question(question, plan_override=None,sql_override=None,peer_comparison=False):
+def run_question(question, plan_override=None,sql_override=None,peer_comparison=False,confirmed_request=None):
+    effective_scope=restore_scope(confirmed_request["scope"]) if confirmed_request else scope
     action_id = str(uuid4())
     st.session_state["pending_action"] = {"sid":sid,"action_id":action_id,"question":question,
-                                          "scope":scope.__dict__,"feature_path":feature_path,"plan_override":plan_override,"sql_override":sql_override,"peer_comparison":peer_comparison,"parent_action_id":parent_action_id,"cohort_name":cohort_name,"parent_event_id":parent_event_id}
+                                          "scope":effective_scope.__dict__,"confirmed_request":confirmed_request,"feature_path":feature_path,"plan_override":plan_override,"sql_override":sql_override,"peer_comparison":peer_comparison,"parent_action_id":parent_action_id,"cohort_name":cohort_name,"parent_event_id":parent_event_id}
     try:
         with st.status("正在分析",expanded=True) as status:
-            completed_result=engine.run(sid,question,scope,action_id,feature_path=feature_path,progress=lambda step:st.write(step),plan_override=plan_override,sql_override=sql_override,peer_comparison=peer_comparison,parent_action_id=parent_action_id,cohort_name=cohort_name,parent_event_id=parent_event_id)
+            completed_result=engine.run(sid,question,effective_scope,action_id,confirmed_request=confirmed_request,feature_path=feature_path,progress=lambda step:st.write(step),plan_override=plan_override,sql_override=sql_override,peer_comparison=peer_comparison,parent_action_id=parent_action_id,cohort_name=cohort_name,parent_event_id=parent_event_id)
             complete=completed_result.get("status")=="FACTS_READY"
             status.update(label="本问题核验完成" if complete else "已保留部分结果，请查看停止原因和缺口",state="complete" if complete else "error")
         st.session_state.pop("pending_action",None)
@@ -235,16 +237,46 @@ def run_question(question, plan_override=None,sql_override=None,peer_comparison=
 
 with middle:
     st.subheader("诊断与追问")
-    with st.form("question_"+sid):
-        question = st.text_area("问题描述",value="比较各流增益，查看异常比例与缺测情况。")
-        peer_comparison = st.checkbox("明确请求同侪比较（需选择目标 UE 或 CRNTI）",value=False)
-        submitted = st.form_submit_button("开始分析",disabled=not(scope_valid and dataset_ok))
+    question = st.text_area("问题描述",value="比较各流增益，查看异常比例与缺测情况。",key='question_text_'+sid)
+    peer_comparison = st.checkbox("明确请求同侪比较（需选择目标 UE 或 CRNTI）",value=False,key='peer_'+sid)
+    submitted = st.button("开始分析",disabled=not(scope_valid and dataset_ok))
     if submitted and question.strip():
-        run_question(question,peer_comparison=peer_comparison)
+        candidate=parse_question(question,scope)
+        st.session_state["question_candidate"]={"candidate":candidate,"question":question,"context":request_identity([sid,scope_dict(scope),feature_path,parent_action_id,cohort_name,parent_event_id,peer_comparison])}
+    draft=st.session_state.get("question_candidate")
+    context_token=request_identity([sid,scope_dict(scope),feature_path,parent_action_id,cohort_name,parent_event_id,peer_comparison])
+    if draft and draft["question"]==question and draft["context"]==context_token and draft["candidate"]["mapping_hash"]==parse_question(question,scope)["mapping_hash"]:
+        st.subheader("问题解析与范围确认")
+        candidate=draft["candidate"]
+        for issue in candidate["issues"]: st.warning(issue)
+        st.caption("确认后才执行正式分析；未明确的范围沿用当前界面，按小区与观测会话分别分析。")
+        edited=dict(candidate['scope'])
+        edit_key=request_identity(draft)
+        for field,label in [('crnti','CRNTI'),('logic_cell_id','小区 logicCellId'),('ue_uid','观测会话'),('resource_id','资源ID'),('phy_cell_inst','物理小区实例'),('start','开始时间（含）'),('end','结束时间（不含）')]:
+            value=st.text_input('确认范围：'+label,value='' if edited.get(field) is None else str(edited[field]),key=edit_key+field)
+            edited[field]=value or None
+        for field in ('crnti','logic_cell_id','resource_id','phy_cell_inst'):
+            if edited[field] is not None:
+                try: edited[field]=int(edited[field],16) if edited[field].lower().startswith('0x') else int(edited[field])
+                except ValueError: st.error(field+'必须为整数')
+        selected_metrics=st.multiselect("分析指标",options=[m["canonical_field"] for m in question_mapping()[0]["fields"]],default=[m["canonical_field"] for m in candidate["metrics"]],key="metric_edit_"+request_identity(draft))
+        trend=st.checkbox("按观测时间绘制折线图",value=candidate["trend"],key="trend_"+request_identity(draft))
+        st.caption("TA单位/缩放待确认时展示原始值；文本中时间须在范围中明确填写，冲突须由你选择。")
+        resolved=st.checkbox("我已明确上述歧义或冲突",key="resolve_"+request_identity(draft)) if candidate["issues"] else True
+        try:
+            selected_scope=restore_scope(edited)
+            preview=confirm_request(session["dataset_dir"],question,selected_scope,selected_metrics,trend)
+            st.write("基础范围预检（追问另受父证据群体约束）" if parent_action_id else "范围预检",preview["preflight"])
+            if st.button("确认并分析",disabled=not resolved):
+                run_question(question,peer_comparison=peer_comparison,confirmed_request=preview)
+        except (ValueError,TypeError) as exc:
+            st.error("请修正范围："+str(exc))
+    elif draft:
+        st.info("问题、范围或映射已变化，请重新点击开始分析以解析。")
     pending = st.session_state.get("pending_action")
     if pending and pending["sid"]==sid and st.button("重试上次未完成操作",disabled=not dataset_ok):
         try:
-            engine.run(sid,pending["question"],restore_scope(pending["scope"]),pending["action_id"],retry=True,
+            engine.run(sid,pending["question"],restore_scope(pending["scope"]),pending["action_id"],retry=True,confirmed_request=pending.get("confirmed_request"),
                        feature_path=pending["feature_path"],plan_override=pending["plan_override"],sql_override=pending.get("sql_override"),peer_comparison=pending.get("peer_comparison",False),parent_action_id=pending.get("parent_action_id"),cohort_name=pending.get("cohort_name"),parent_event_id=pending.get("parent_event_id"))
             st.session_state.pop("pending_action",None)
             st.rerun()
@@ -297,6 +329,9 @@ with right:
         st.info("完成一次分析后显示结果与审核入口。")
     else:
         result = st.selectbox("历史结果",completed,format_func=lambda r:r["question"][:45]+" · "+r["action_id"][:8],index=len(completed)-1)
+        if result.get("confirmed_request"):
+            with st.expander("已确认的分析请求"):
+                st.json(result["confirmed_request"])
         st.caption("数据版本："+result["dataset_fingerprint"][:16]+"；当前画布范围："+dumps(result["scope"]))
         panel = st.selectbox("选择画布内容",["统计与图表","查询证据","特性条件","案例审核"],key="panel_"+sid)
         if panel=="统计与图表":
@@ -320,6 +355,22 @@ with right:
                         st.warning('状态观测证据不可用或校验失败，未绘图。')
             elif any(word in result['question'] for word in ('变化','切换','趋势','时序')):
                 st.info('本次结果没有会话状态观测证据，无法绘制状态变化图。')
+            for a in result.get('artifacts',[]):
+                if a.get('operator')=='METRIC_TIME_SERIES':
+                    try:
+                        verify_artifact(a)
+                        batch=next(pq.ParquetFile(a['path']).iter_batches(batch_size=2000),None)
+                        points=batch.to_pandas() if batch else pd.DataFrame()
+                        if not points.empty:
+                            points['对象']=points.logicCellId.astype(str)+' / '+points.ue_uid.astype(str)
+                            points.loc[points.barrier,'value']=float('nan')
+                            fig=px.line(points,x='event_ts',y='value',color='对象',line_group='segment',markers=True,title=a['field']+' 时间折线图',labels={'event_ts':'观测时间','value':a['unit']})
+                            fig.update_traces(connectgaps=False)
+                            st.plotly_chart(fig,use_container_width=True,key=a['artifact_id'])
+                        st.dataframe(pd.DataFrame(a.get('group_statistics',[])),hide_index=True)
+                        st.caption('最多预览2000时点，完整统计：'+dumps(a['statistics'])+'。冲突/缺失断线，不推断间隔内过程。')
+                    except (ValueError,OSError):
+                        st.warning('时序证据校验失败，未绘图。')
             summary = result["summary"]
             st.metric("流控有效记录",summary["flow_valid_count"])
             st.metric("业务准入记录",summary.get("business_valid_count",summary["flow_valid_count"]))
@@ -399,7 +450,7 @@ with right:
                 budget_info=result.get('budget_diagnostics',{})
                 if budget_info:
                     st.caption(f"整次分析预算 {budget_info['total_seconds']} 秒；进入验证循环时剩余 {budget_info.get('loop_entry_remaining_seconds')} 秒；结束时剩余 {budget_info['remaining_seconds']} 秒。")
-                    st.dataframe(pd.DataFrame([{'阶段':name,'累计耗时（秒）':elapsed} for name,elapsed in budget_info.get('stage_seconds',{}).items()]),hide_index=True)
+                    st.dataframe(pd.DataFrame([{'阶段':name,'状态':budget_info.get('stage_status',{}).get(name,'历史记录'),'累计耗时（秒）':elapsed} for name,elapsed in budget_info.get('stage_seconds',{}).items()]),hide_index=True)
                 st.json(result.get('verification_loop',{}))
             advanced=st.checkbox('显示技术详情与高级查询',value=False,key='advanced_'+sid)
             if advanced:
