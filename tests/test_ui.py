@@ -25,13 +25,15 @@ class UiTests(unittest.TestCase):
             self.assertFalse(app.exception)
             next(b for b in app.button if b.label=="开始分析").click().run()
             self.assertFalse(app.exception)
-            self.assertEqual(len(engine.store.history(sid)),0)
-            next(t for t in app.text_area if t.label=='问题描述').set_value('查看增益').run()
-            self.assertFalse(any(b.label=='确认并分析' for b in app.button))
-            next(b for b in app.button if b.label=='开始分析').click().run()
-            next(b for b in app.button if b.label=="确认并分析").click().run()
-            self.assertFalse(app.exception)
             self.assertEqual(len(engine.store.history(sid)),1)
+            self.assertFalse(any(b.label=='确认并分析' for b in app.button))
+            self.assertTrue(any(c.value.startswith('查询逻辑：') for c in app.caption))
+            self.assertEqual(engine.store.history(sid)[-1]['confirmed_request']['execution_mode'],'AUTO_FROM_QUESTION')
+            next(t for t in app.text_area if t.label=='问题描述').set_value('查看增益').run()
+            self.assertEqual(len(engine.store.history(sid)),1)  # Editing never executes automatically.
+            next(b for b in app.button if b.label=='开始分析').click().run()
+            self.assertFalse(app.exception)
+            self.assertEqual(len(engine.store.history(sid)),2)
             next(r for r in app.selectbox if r.label=="选择画布内容").set_value("查询证据").run()
             self.assertFalse(app.exception)
             self.assertFalse(any(b.label=="执行探索 SQL" for b in app.button))
@@ -45,6 +47,27 @@ class UiTests(unittest.TestCase):
             next(b for b in app.button if b.label=="审核并发布").click().run()
             self.assertFalse(app.exception)
             self.assertEqual(len(engine.index.documents()),1)
+
+    def test_conflicting_scope_does_not_execute_wrong_user(self):
+        import streamlit as st
+        st.cache_resource.clear()
+        engine=DiagnosticEngine(self.root/'conflict_ui',self.root/'conflict_knowledge',model=ModelService(ServiceConfig()))
+        sid=engine.store.create(self.normal_db,'范围冲突')
+        with patch('srs_helper.agent.DiagnosticEngine',return_value=engine):
+            app=AppTest.from_file('app.py',default_timeout=30).run()
+            next(t for t in app.text_input if t.label=='CRNTI（空为全部）').set_value('1000')
+            next(t for t in app.text_area if t.label=='问题描述').set_value('1001这个用户的增益')
+            next(b for b in app.button if b.label=='开始分析').click().run()
+            self.assertFalse(app.exception)
+            self.assertEqual(engine.store.history(sid),[])
+            self.assertTrue(any('冲突' in w.value for w in app.warning))
+            self.assertTrue(any(b.label=='确认并分析' for b in app.button))
+            next(t for t in app.text_area if t.label=='问题描述').set_value('1000这个用户的增益')
+            next(b for b in app.button if b.label=='开始分析').click().run()
+            self.assertFalse(app.exception)
+            self.assertEqual(engine.store.history(sid)[-1]['scope']['crnti'],1000)
+            self.assertFalse(any(b.label=='确认并分析' for b in app.button))
+        st.cache_resource.clear()
 
     def test_feature_ratio_and_observation_canvas(self):
         import streamlit as st

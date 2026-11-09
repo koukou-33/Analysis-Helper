@@ -129,9 +129,9 @@ class ContinuousAnalysisTests(unittest.TestCase):
             next(t for t in app.text_area if t.label=='问题描述').set_value('这些记录的 SPF 未生效条件')
             next(b for b in app.button if b.label=='开始分析').click().run()
             self.assertFalse(app.exception)
-            self.assertEqual(len(self.engine.store.history(self.sid)),1)
-            next(b for b in app.button if b.label=='确认并分析').click().run()
-            self.assertFalse(app.exception)
+            self.assertEqual(len(self.engine.store.history(self.sid)),2)
+            self.assertFalse(any(b.label=='确认并分析' for b in app.button))
+            self.assertTrue(any('仅使用所选父证据群体' in c.value for c in app.caption))
             latest=self.engine.store.history(self.sid)[-1]
             self.assertEqual(latest['analysis_context']['parent_analysis_id'],first['action_id'])
             self.assertEqual(latest['feature']['sample_cnt'],6)

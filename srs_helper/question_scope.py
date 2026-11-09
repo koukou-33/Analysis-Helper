@@ -47,8 +47,11 @@ def parse_question(question,scope):
             metrics.append(item)
     if re.search(r'\d',question) and not re.search(r'用户|crnti|小区|logicCellId',question,re.I): issues.append('数字含义未明确，请核对对象和范围')
     return {'scope':proposed,'metrics':metrics,'issues':issues,'mapping_hash':version,
-            'trend':temporal_intent(question), 'single_subject_candidate':single_subject_candidate(question)}
-def confirm_request(directory,question,scope,metrics,trend,single_subject=False):
+            'trend':temporal_intent(question), 'single_subject_candidate':single_subject_candidate(question),
+            'single_subject_statement':single_subject_candidate(question) and not re.search(r'是否|是不是|可能|假设|假如|不是|不属于|吗',re.split(r'[，,。；;]',question)[0])}
+def confirm_request(directory,question,scope,metrics,trend,single_subject=False,execution_mode='MANUAL_CONFIRMATION'):
+    if execution_mode not in {'MANUAL_CONFIRMATION','AUTO_FROM_QUESTION'}:
+        raise ValueError('未知执行方式')
     scope.where()
     for key in ('crnti','logic_cell_id','resource_id','phy_cell_inst'):
         value=getattr(scope,key)
@@ -68,15 +71,34 @@ def confirm_request(directory,question,scope,metrics,trend,single_subject=False)
         'chart':'OBSERVATION_LINE','bucket':'RAW_OBSERVATIONS','confirmed_at':datetime.now().isoformat(),
         'preflight':{'records':count,'cells':cells,'sessions':sessions,'unavailable_fields':[m for m in metrics if m not in available]}}
     request['intent_version']=INTENT_VERSION
+    request['execution_mode']=execution_mode
     request['subject_assertion']=({'type':'USER_ASSERTED_SINGLE_SUBJECT','scope':scope_dict(scope),
-        'dataset_fingerprint':meta['dataset_fingerprint'],'source':'EXPLICIT_USER_CONFIRMATION',
+        'dataset_fingerprint':meta['dataset_fingerprint'],'source':'EXPLICIT_USER_STATEMENT' if execution_mode=='AUTO_FROM_QUESTION' else 'EXPLICIT_USER_CONFIRMATION',
         'statement':question,'cross_segment_lines':False} if single_subject else None)
     request['request_hash']=identity(request)
     return request
 
+
+def query_logic(request, inherited=False, peer_comparison=False):
+    """Describe the fixed scope and policy, not hidden reasoning or guessed SQL."""
+    scope=request['scope']
+    labels={'logic_cell_id':'小区','crnti':'CRNTI','ue_uid':'观测会话','resource_id':'资源','phy_cell_inst':'物理小区'}
+    parts=[label+' '+str(scope[k]) for k,label in labels.items() if scope.get(k) is not None]
+    if scope.get('start'): parts.append('从 '+str(scope['start'])+'（含）')
+    if scope.get('end'): parts.append('至 '+str(scope['end'])+'（不含）')
+    target='、'.join(parts) or '当前数据集全部范围'
+    metrics='、'.join(m.get('display_name',m['canonical_field'])+'（'+m['canonical_field']+'）' for m in request.get('metrics',[])) or '问题相关指标'
+    steps=[f'查询{target}内的{metrics}','按业务有效记录统计']
+    if inherited: steps.append('仅使用所选父证据群体')
+    if request.get('subject_assertion'): steps.append('依据本次提问将多个 CRNTI 视为同一用户')
+    if request.get('trend'): steps.append('按小区和接入会话查看时间变化，段间不连线')
+    if peer_comparison: steps.append('按已请求的同侪约束比较')
+    return '查询逻辑：'+'，'.join(steps)+'。'
+
 def validate_request(request,meta,question,scope,check_mapping=True):
     content={k:v for k,v in request.items() if k!='request_hash'}
     if identity(content)!=request.get('request_hash'): raise ValueError('确认请求哈希不匹配')
+    if request.get('execution_mode') not in {None,'MANUAL_CONFIRMATION','AUTO_FROM_QUESTION'}: raise ValueError('未知执行方式')
     if request.get('version')!='analysis-request.v1' or request['question']!=question or request['scope']!=scope_dict(scope): raise ValueError('问题或范围已变化，请重新确认')
     if (request['dataset_id'],request['dataset_fingerprint'])!=(meta['dataset_id'],meta['dataset_fingerprint']): raise ValueError('数据版本已变化，请重新确认')
     assertion=request.get('subject_assertion')

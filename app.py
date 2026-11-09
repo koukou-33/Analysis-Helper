@@ -24,7 +24,7 @@ from srs_helper.pipeline import build_dataset
 from srs_helper.provenance import record_trace, evidence_contains_record
 from srs_helper.queries import Scope
 from srs_helper.sessions import dumps
-from srs_helper.question_scope import parse_question, confirm_request, scope_dict, identity as request_identity, mapping as question_mapping
+from srs_helper.question_scope import parse_question, confirm_request, scope_dict, identity as request_identity, mapping as question_mapping, query_logic
 from srs_helper.visual import export_chart
 from srs_helper.canvas import OPERATORS, describe_artifact, expression_text, feature_figures, observation_figure
 
@@ -227,8 +227,10 @@ def run_question(question, plan_override=None,sql_override=None,peer_comparison=
     st.session_state["pending_action"] = {"sid":sid,"action_id":action_id,"question":question,
                                           "scope":effective_scope.__dict__,"confirmed_request":confirmed_request,"feature_path":feature_path,"plan_override":plan_override,"sql_override":sql_override,"peer_comparison":peer_comparison,"parent_action_id":parent_action_id,"cohort_name":cohort_name,"parent_event_id":parent_event_id}
     try:
-        with st.status("正在分析",expanded=True) as status:
-            completed_result=engine.run(sid,question,effective_scope,action_id,confirmed_request=confirmed_request,feature_path=feature_path,progress=lambda step:st.write(step),plan_override=plan_override,sql_override=sql_override,peer_comparison=peer_comparison,parent_action_id=parent_action_id,cohort_name=cohort_name,parent_event_id=parent_event_id)
+        with st.status("正在分析",expanded=False) as status:
+            if confirmed_request:
+                st.caption(query_logic(confirmed_request,bool(parent_action_id),peer_comparison))
+            completed_result=engine.run(sid,question,effective_scope,action_id,confirmed_request=confirmed_request,feature_path=feature_path,progress=None,plan_override=plan_override,sql_override=sql_override,peer_comparison=peer_comparison,parent_action_id=parent_action_id,cohort_name=cohort_name,parent_event_id=parent_event_id)
             complete=completed_result.get("status")=="FACTS_READY"
             status.update(label="本问题核验完成" if complete else "已保留部分结果，请查看停止原因和缺口",state="complete" if complete else "error")
         st.session_state.pop("pending_action",None)
@@ -246,14 +248,25 @@ with middle:
     submitted = st.button("开始分析",disabled=not(scope_valid and dataset_ok))
     if submitted and question.strip():
         candidate=parse_question(question,scope)
-        st.session_state["question_candidate"]={"candidate":candidate,"question":question,"context":request_identity([sid,scope_dict(scope),feature_path,parent_action_id,cohort_name,parent_event_id,peer_comparison])}
+        if not candidate['issues']:
+            st.session_state.pop('question_candidate',None)
+            try:
+                request=confirm_request(session['dataset_dir'],question,restore_scope(candidate['scope']),
+                    [m['canonical_field'] for m in candidate['metrics']],candidate['trend'],
+                    single_subject=candidate.get('single_subject_statement',False),execution_mode='AUTO_FROM_QUESTION')
+                st.caption(query_logic(request,bool(parent_action_id),peer_comparison))
+                run_question(question,peer_comparison=peer_comparison,confirmed_request=request)
+            except (ValueError,TypeError) as exc:
+                st.error('无法确定查询范围：'+str(exc))
+        else:
+            st.session_state["question_candidate"]={"candidate":candidate,"question":question,"context":request_identity([sid,scope_dict(scope),feature_path,parent_action_id,cohort_name,parent_event_id,peer_comparison])}
     draft=st.session_state.get("question_candidate")
     context_token=request_identity([sid,scope_dict(scope),feature_path,parent_action_id,cohort_name,parent_event_id,peer_comparison])
     if draft and draft["question"]==question and draft["context"]==context_token and draft["candidate"]["mapping_hash"]==parse_question(question,scope)["mapping_hash"]:
-        st.subheader("问题解析与范围确认")
+        st.subheader("请修正查询歧义")
         candidate=draft["candidate"]
         for issue in candidate["issues"]: st.warning(issue)
-        st.caption("确认后才执行正式分析；未明确的范围沿用当前界面，按小区与观测会话分别分析。")
+        st.caption("当前问题存在范围冲突或无法解析的条件；修正后即可执行，普通问题会直接开始分析。")
         edited=dict(candidate['scope'])
         edit_key=request_identity(draft)
         for field,label in [('crnti','CRNTI'),('logic_cell_id','小区 logicCellId'),('ue_uid','观测会话'),('resource_id','资源ID'),('phy_cell_inst','物理小区实例'),('start','开始时间（含）'),('end','结束时间（不含）')]:
@@ -293,42 +306,46 @@ with middle:
         with st.chat_message("user"):
             st.write(item["question"])
         with st.chat_message("assistant"):
+            if item.get('confirmed_request'):
+                st.caption(query_logic(item['confirmed_request'],bool(item.get('analysis_context',{}).get('parent_analysis_id')),item.get('peers',{}).get('status') not in {None,'NOT_REQUESTED'}))
             st.write(item["answer"])
-            st.caption("范围："+dumps(item["scope"]))
-            for notice in item["notices"]:
+            for notice in item['notices']:
                 st.warning(notice)
-            for hypothesis in item.get("hypotheses",[]):
-                status=hypothesis.get('status')
-                if status:
-                    st.info({'SUPPORTED':'条件判断获支持','REFUTED':'条件判断被反驳','INCONCLUSIVE':'条件判断未定'}.get(status,status)+'：'+hypothesis['text'])
-                    st.caption(hypothesis.get('interpretation','')+' · '+str(hypothesis.get('counts',{})))
-                else:
-                    st.info('历史结果中的待验证假设（尚未完成自动核验）：'+hypothesis['text'])
-                st.caption("引用："+", ".join(hypothesis["references"]))
-            for claim in item.get("claims",[]):
-                st.write("已校验数值",claim)
-            if item.get("visual"):
-                visual = item["visual"]
-                if visual["status"]=="COMPARED":
-                    st.info("视觉比对（定性参考，不确认根因）")
-                    st.json(visual["result"])
-                else:
-                    st.caption(visual.get("reason","本轮未执行视觉比对。"))
-            for ref in item.get("references",[]):
-                with st.expander("知识参考："+ref["title"]):
-                    st.write(ref["excerpt"])
-                    st.caption(ref["path"]+" @ "+ref["version"][:12])
-                    st.caption("相似点：检索词匹配；差异与适用条件尚需验证。参考不等于根因确认。")
-                    archive = engine.index.storage/"versions"/ref["version"]
-                    if (archive/"document.json").exists():
-                        doc = json.loads((archive/"document.json").read_text(encoding="utf-8"))
-                        for im in doc["images"]:
-                            try:
-                                st.image(str(safe_asset(archive,im["path"])),caption="历史参考图："+im["caption"])
-                            except Exception:
-                                st.warning("历史参考图片不可用。")
-            if item.get("missing_artifacts"):
-                st.warning("部分证据文件缺失；可重新分析生成新证据，旧引用不覆盖。")
+            with st.expander("分析依据与执行详情",expanded=False):
+                st.caption("范围："+dumps(item["scope"]))
+                for hypothesis in item.get("hypotheses",[]):
+                    status=hypothesis.get('status')
+                    if status:
+                        st.info({'SUPPORTED':'条件判断获支持','REFUTED':'条件判断被反驳','INCONCLUSIVE':'条件判断未定'}.get(status,status)+'：'+hypothesis['text'])
+                        st.caption(hypothesis.get('interpretation','')+' · '+str(hypothesis.get('counts',{})))
+                    else:
+                        st.info('历史结果中的待验证假设（尚未完成自动核验）：'+hypothesis['text'])
+                    st.caption("引用："+", ".join(hypothesis["references"]))
+                for claim in item.get("claims",[]):
+                    st.write("已校验数值",claim)
+                if item.get("visual"):
+                    visual = item["visual"]
+                    if visual["status"]=="COMPARED":
+                        st.info("视觉比对（定性参考，不确认根因）")
+                        st.json(visual["result"])
+                    else:
+                        st.caption(visual.get("reason","本轮未执行视觉比对。"))
+                for ref in item.get("references",[]):
+                    with st.expander("知识参考："+ref["title"]):
+                        st.write(ref["excerpt"])
+                        st.caption(ref["path"]+" @ "+ref["version"][:12])
+                        st.caption("相似点：检索词匹配；差异与适用条件尚需验证。参考不等于根因确认。")
+                        archive = engine.index.storage/"versions"/ref["version"]
+                        if (archive/"document.json").exists():
+                            doc = json.loads((archive/"document.json").read_text(encoding="utf-8"))
+                            for im in doc["images"]:
+                                try:
+                                    st.image(str(safe_asset(archive,im["path"])),caption="历史参考图："+im["caption"])
+                                except Exception:
+                                    st.warning("历史参考图片不可用。")
+                if item.get("missing_artifacts"):
+                    st.warning("部分证据文件缺失；可重新分析生成新证据，旧引用不覆盖。")
+
 
 with right:
     st.subheader("证据画布与案例审核")
@@ -337,7 +354,7 @@ with right:
     else:
         result = st.selectbox("历史结果",completed,format_func=lambda r:r["question"][:45]+" · "+r["action_id"][:8],index=len(completed)-1)
         if result.get("confirmed_request"):
-            with st.expander("已确认的分析请求"):
+            with st.expander("本次分析请求"):
                 st.json(result["confirmed_request"])
         st.caption("数据版本："+result["dataset_fingerprint"][:16]+"；当前画布范围："+dumps(result["scope"]))
         panel = st.selectbox("选择画布内容",["统计与图表","查询证据","特性条件","案例审核"],key="panel_"+sid)

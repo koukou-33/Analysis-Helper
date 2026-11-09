@@ -19,6 +19,8 @@ class QuestionScopeTests(unittest.TestCase):
         self.assertTrue(parse_question('1911和1912',Scope())['issues'])
         self.assertEqual(parse_question('CRNTI=0x777',Scope())['scope']['crnti'],1911)
         self.assertTrue(parse_question('昨天TA',Scope())['issues'])
+        self.assertTrue(parse_question('所有crnti实际都是一个用户，他的TA变化',Scope())['single_subject_statement'])
+        self.assertFalse(parse_question('所有crnti是不是一个用户，TA变化如何',Scope())['single_subject_statement'])
 
     def test_confirmed_trend_full_scope_and_integrity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -63,9 +65,13 @@ class QuestionScopeTests(unittest.TestCase):
             unavailable=confirm_request(directory,'缺失',scope,[],False)
             self.assertEqual(unavailable['metrics'],[])
             all_question='所有crnti实际都是一个用户，不同接入后不同的crnti，他在不同小区的TA变化怎么样'
-            all_request=confirm_request(directory,all_question,Scope(),['taValue'],True,single_subject=True)
+            all_request=confirm_request(directory,all_question,Scope(),['taValue'],True,single_subject=True,execution_mode='AUTO_FROM_QUESTION')
+            self.assertEqual(all_request['subject_assertion']['source'],'EXPLICIT_USER_STATEMENT')
+            from srs_helper.question_scope import query_logic
+            self.assertIn('当前数据集全部范围',query_logic(all_request))
+            self.assertIn('仅使用所选父证据群体',query_logic(all_request,inherited=True))
             all_result=engine.run(sid,all_question,Scope(),confirmed_request=all_request)
-            self.assertIn('依据用户本次确认',all_result['answer'])
+            self.assertIn('依据用户本次说明',all_result['answer'])
             all_artifact=next(a for a in all_result['artifacts'] if a['operator']=='METRIC_TIME_SERIES')
             all_points=pq.read_table(all_artifact['path']).to_pylist()
             self.assertEqual({v for row in all_points for v in row['crntis']},{1911,22})

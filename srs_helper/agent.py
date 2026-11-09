@@ -524,7 +524,7 @@ class DiagnosticEngine:
             restrictions=limitations_for(state.get('plan'),ephemeral['artifacts'])
             if restrictions: answer+='\n\n分析限制：\n'+'\n'.join('- '+v for v in restrictions)
             if (confirmed_request or {}).get('subject_assertion'):
-                answer+='\n依据用户本次确认：当前范围内的 CRNTI 属于同一用户。保留各小区及接入会话分段，段间不连线；这不是数据自动证明的身份。'
+                answer+='\n依据用户本次说明：当前范围内的 CRNTI 属于同一用户。保留各小区及接入会话分段，段间不连线；这不是数据自动证明的身份。'
             if not s["flow_valid_count"]:
                 answer += " 当前范围无数据，不能据此确认或排除根因。"
             missing_gains = gains_missing(s)
