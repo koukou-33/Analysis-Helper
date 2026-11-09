@@ -26,7 +26,7 @@ class QuestionScopeTests(unittest.TestCase):
             with source.open('w',newline='') as stream:
                 w=csv.writer(stream); w.writerow(['ueLayerNum','uwTtiCnt1','logicCellId','crnti','uwData','uwTime','taValue'])
                 for i,(ue,v) in enumerate([(1911,1),(1911,''),(1911,3),(1911,4),(22,99)]):
-                    w.writerow([4,i,0,ue,'2026-11-05',f'00:00:0{i}.000',v])
+                    w.writerow([4,i,0 if ue==1911 else 1,ue,'2026-11-05',f'00:00:0{i}.000',v])
             directory,meta=build_dataset(source,root/'data',json.loads(Path('config/input_contract.json').read_text()))
             scope=Scope(crnti=1911)
             request=confirm_request(directory,'1911这个用户的TA变化',scope,['taValue'],True)
@@ -62,3 +62,14 @@ class QuestionScopeTests(unittest.TestCase):
                 confirm_request(directory,'bad',scope,['not_registered'],True)
             unavailable=confirm_request(directory,'缺失',scope,[],False)
             self.assertEqual(unavailable['metrics'],[])
+            all_question='所有crnti实际都是一个用户，不同接入后不同的crnti，他在不同小区的TA变化怎么样'
+            all_request=confirm_request(directory,all_question,Scope(),['taValue'],True,single_subject=True)
+            all_result=engine.run(sid,all_question,Scope(),confirmed_request=all_request)
+            self.assertIn('依据用户本次确认',all_result['answer'])
+            all_artifact=next(a for a in all_result['artifacts'] if a['operator']=='METRIC_TIME_SERIES')
+            all_points=pq.read_table(all_artifact['path']).to_pylist()
+            self.assertEqual({v for row in all_points for v in row['crntis']},{1911,22})
+            self.assertEqual(all_artifact['statistics']['maximum'],99)
+            self.assertEqual({r['logicCellId'] for r in all_points},{0,1})
+            self.assertEqual(all_request['subject_assertion']['scope'],all_result['scope'])
+            self.assertIsNone(confirm_request(directory,all_question,Scope(),['taValue'],True)['subject_assertion'])

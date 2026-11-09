@@ -1,3 +1,7 @@
+from srs_helper.intents import temporal_intent
+from srs_helper.progress import StorageFailure
+from srs_helper.result_summary import read_summary
+from srs_helper.chart_preview import chart_objects, time_coverage
 """Run with: python -m streamlit run app.py"""
 import json
 import re
@@ -229,7 +233,7 @@ def run_question(question, plan_override=None,sql_override=None,peer_comparison=
             status.update(label="本问题核验完成" if complete else "已保留部分结果，请查看停止原因和缺口",state="complete" if complete else "error")
         st.session_state.pop("pending_action",None)
         st.rerun()
-    except ValueError as exc:
+    except (ValueError,StorageFailure) as exc:
         st.error(str(exc))
     except Exception:
         st.error("本次操作未完成，已有证据保留。可显式重试。")
@@ -261,11 +265,14 @@ with middle:
                 except ValueError: st.error(field+'必须为整数')
         selected_metrics=st.multiselect("分析指标",options=[m["canonical_field"] for m in question_mapping()[0]["fields"]],default=[m["canonical_field"] for m in candidate["metrics"]],key="metric_edit_"+request_identity(draft))
         trend=st.checkbox("按观测时间绘制折线图",value=candidate["trend"],key="trend_"+request_identity(draft))
+        if candidate.get('single_subject_candidate'):
+            st.info('检测到多 CRNTI 同一用户说明，请确认仅适用于以下范围。若界面已筛选单个 CRNTI，请先清空或修改确认范围。')
+        single_subject=st.checkbox('我确认当前范围内所有 CRNTI 属于同一用户（仅本次分析）',value=False,key='subject_'+edit_key)
         st.caption("TA单位/缩放待确认时展示原始值；文本中时间须在范围中明确填写，冲突须由你选择。")
         resolved=st.checkbox("我已明确上述歧义或冲突",key="resolve_"+request_identity(draft)) if candidate["issues"] else True
         try:
             selected_scope=restore_scope(edited)
-            preview=confirm_request(session["dataset_dir"],question,selected_scope,selected_metrics,trend)
+            preview=confirm_request(session["dataset_dir"],question,selected_scope,selected_metrics,trend,single_subject=single_subject)
             st.write("基础范围预检（追问另受父证据群体约束）" if parent_action_id else "范围预检",preview["preflight"])
             if st.button("确认并分析",disabled=not resolved):
                 run_question(question,peer_comparison=peer_comparison,confirmed_request=preview)
@@ -340,35 +347,44 @@ with right:
                 st.caption(caption)
             observations=[a for a in result.get('artifacts',[]) if a.get('operator')=='SESSION_OBSERVATIONS']
             if observations:
-                with st.expander('状态变化图',expanded=any(word in result['question'] for word in ('变化','切换','趋势','时序'))):
+                with st.expander('状态变化图',expanded=(result.get('confirmed_request') or {}).get('trend',temporal_intent(result['question']))):
                     try:
                         artifact=observations[0]
                         verify_artifact(artifact)
-                        batch=next(pq.ParquetFile(artifact['path']).iter_batches(batch_size=2000),None)
-                        figure=observation_figure(batch.to_pylist() if batch else [])
+                        state_search=st.text_input('筛选状态观测会话',key='obs_search_'+artifact['artifact_id'])
+                        state_objects=chart_objects(artifact,state_search)
+                        if len(state_objects)>500: st.info('超过500个会话，请筛选会话编号。')
+                        selected_observation=st.selectbox('选择状态观测会话',state_objects[:500],format_func=lambda o:str(o[1]),key='obs_object_'+artifact['artifact_id']) if state_objects else None
+                        state_points,state_coverage=time_coverage(artifact,*selected_observation) if selected_observation else (pd.DataFrame(),{})
+                        figure=observation_figure(state_points.to_dict('records'))
                         if figure is not None:
                             st.plotly_chart(figure,use_container_width=True,key='observations_'+result['action_id'])
-                            st.caption(f"最多展示前 2000 个观测点，完整证据 {artifact['row_count']} 行。点之间不连线，不推断间隔内持续状态或精确切换时刻。完整结果可在查询证据下载。")
+                            st.caption('所选会话全时间覆盖预览：'+dumps(state_coverage)+'。点之间不连线，不推断间隔内持续状态或精确切换时刻。完整结果可在查询证据下载。')
                         else:
                             st.info('当前范围没有可绘制的状态观测。')
                     except (ValueError,OSError):
                         st.warning('状态观测证据不可用或校验失败，未绘图。')
-            elif any(word in result['question'] for word in ('变化','切换','趋势','时序')):
+            elif (result.get('confirmed_request') or {}).get('trend',temporal_intent(result['question'])):
                 st.info('本次结果没有会话状态观测证据，无法绘制状态变化图。')
             for a in result.get('artifacts',[]):
                 if a.get('operator')=='METRIC_TIME_SERIES':
                     try:
                         verify_artifact(a)
-                        batch=next(pq.ParquetFile(a['path']).iter_batches(batch_size=2000),None)
-                        points=batch.to_pandas() if batch else pd.DataFrame()
+                        search=st.text_input('筛选观测会话（可选）',key='chart_search_'+a['artifact_id'])
+                        objects=chart_objects(a,search)
+                        if len(objects)>500: st.info('超过500个对象，请用会话编号筛选；当前只列出前500个对象。')
+                        chosen=st.selectbox('选择小区 / 观测会话',objects[:500],format_func=lambda o:str(o[0])+' / '+str(o[1]),key='chart_object_'+a['artifact_id']) if objects else None
+                        points,coverage=time_coverage(a,*chosen) if chosen else (pd.DataFrame(),{})
                         if not points.empty:
+                            points=points.sort_values(['logicCellId','ue_uid','segment','event_ts'],kind='stable')
                             points['对象']=points.logicCellId.astype(str)+' / '+points.ue_uid.astype(str)
                             points.loc[points.barrier,'value']=float('nan')
                             fig=px.line(points,x='event_ts',y='value',color='对象',line_group='segment',markers=True,title=a['field']+' 时间折线图',labels={'event_ts':'观测时间','value':a['unit']})
                             fig.update_traces(connectgaps=False)
                             st.plotly_chart(fig,use_container_width=True,key=a['artifact_id'])
+                        st.caption('当前对象的全时间范围覆盖预览：'+dumps(coverage)+'。段间不连线；降采样点不用于总体统计。')
                         st.dataframe(pd.DataFrame(a.get('group_statistics',[])),hide_index=True)
-                        st.caption('最多预览2000时点，完整统计：'+dumps(a['statistics'])+'。冲突/缺失断线，不推断间隔内过程。')
+                        st.caption('每个所选对象最多预览2000时点，完整统计：'+dumps(a['statistics'])+'。冲突/缺失断线，不推断间隔内过程。')
                     except (ValueError,OSError):
                         st.warning('时序证据校验失败，未绘图。')
             summary = result["summary"]
@@ -467,13 +483,18 @@ with right:
                     st.error('记录不属于本轮证据，或原始快照校验失败。')
             for artifact in result["artifacts"]:
                 with st.expander(OPERATORS.get(artifact['operator'],'查询结果')+" · "+artifact["step_id"]):
-                    st.caption(f"完整行数 {artifact['row_count']}；预览最多 100 行；SHA256 {artifact['sha256']}")
+                    st.caption(f"完整行数 {artifact['row_count']}；覆盖预览 {len(artifact['preview'])} 行；SHA256 {artifact['sha256']}")
+                    st.caption(dumps(artifact.get('preview_policy',{'method':'历史头部预览，不代表全量分布'})))
                     st.write(describe_artifact(artifact,result.get('plan')))
                     if advanced:
                         st.code(artifact.get("sql","内部条件逐记录关系"),language="sql")
                         st.write("绑定参数",artifact.get("parameters",[]))
                     try:
                         verify_artifact(artifact)
+                        summary_evidence=read_summary(artifact)
+                        if summary_evidence:
+                            st.dataframe(pd.DataFrame(summary_evidence['facts']),hide_index=True)
+                            for restriction in summary_evidence.get('limitations',[]): st.caption(restriction)
                         st.dataframe(quality_style(pd.DataFrame(artifact["preview"])),hide_index=True)
                         st.download_button("下载完整 Parquet",Path(artifact["path"]).read_bytes(),Path(artifact["path"]).name,key=artifact["artifact_id"])
                     except Exception:

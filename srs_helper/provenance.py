@@ -39,11 +39,15 @@ def save_table(table, folder, base, operator, parents=()):
     pq.write_table(table,path)
     with path.open('rb') as stream:
         digest=hashlib.file_digest(stream,'sha256').hexdigest()
+    from .preview import CoveragePreview
+    sampler=CoveragePreview(table.column_names)
+    for batch in table.to_batches(max_chunksize=2048):
+        for row in batch.to_pylist(): sampler.add(row)
     return {**{k:base[k] for k in ('dataset_id','dataset_fingerprint','scope','quality_policy')},
             'input_cohort_id':base.get('input_cohort_id'),
             'artifact_id':aid,'path':str(path.resolve()),'sha256':digest,'step_id':operator,
-            'operator':operator,'row_count':table.num_rows,'preview':table.slice(0,100).to_pylist(),
-            'preview_truncated':table.num_rows>100,'parent_artifact_ids':[a['artifact_id'] for a in parents]}
+            'operator':operator,'row_count':table.num_rows,'preview':sampler.rows(),'preview_policy':sampler.metadata(),
+            'preview_truncated':table.num_rows>len(sampler.rows()),'parent_artifact_ids':[a['artifact_id'] for a in parents]}
 
 
 def feature_cohorts(feature, source, folder):
@@ -188,12 +192,13 @@ class ArtifactWriter:
         self.aid=str(uuid4()); self.path=Path(folder)/(self.aid+'.parquet')
         self.writer=pq.ParquetWriter(self.path,schema); self.schema=schema
         self.base=base; self.operator=operator; self.parent=parent
-        self.buffer=[]; self.preview=[]; self.count=0
+        from .preview import CoveragePreview
+        self.buffer=[]; self.sampler=CoveragePreview(schema.names); self.count=0
 
     def append(self,row):
         self.buffer.append(row); self.count+=1
         if self.count>1000000: raise ValueError('State result exceeds one million rows')
-        if len(self.preview)<100: self.preview.append(row)
+        self.sampler.add(row)
         if len(self.buffer)>=2048: self.flush()
 
     def flush(self):
@@ -205,8 +210,8 @@ class ArtifactWriter:
         with self.path.open('rb') as stream: digest=hashlib.file_digest(stream,'sha256').hexdigest()
         return {**{k:self.base[k] for k in ('dataset_id','dataset_fingerprint','scope','quality_policy')},
             'input_cohort_id':self.base.get('input_cohort_id'), 'artifact_id':self.aid,'path':str(self.path.resolve()),'sha256':digest,
-            'step_id':self.operator,'operator':self.operator,'row_count':self.count,'preview':self.preview,
-            'preview_truncated':self.count>100,'parent_artifact_ids':[self.parent['artifact_id']]}
+            'step_id':self.operator,'operator':self.operator,'row_count':self.count,'preview':self.sampler.rows(),'preview_policy':self.sampler.metadata(),
+            'preview_truncated':self.count>len(self.sampler.rows()),'parent_artifact_ids':[self.parent['artifact_id']]}
 
 
 def event_population(parent, event_id, folder):

@@ -123,6 +123,9 @@ def measured(stage):
                 return result
             except BaseException as exc:
                 record.update(status='ERROR', error_type=type(exc).__name__)
+                if isinstance(exc,OSError):
+                    record.update(errno=exc.errno,winerror=getattr(exc,'winerror',None))
+                if getattr(exc,'code',None)=='STORAGE_FAILURE': record['error_code']='STORAGE_FAILURE'
                 raise
             finally:
                 record['elapsed_seconds'] = round(time.perf_counter()-started,6)

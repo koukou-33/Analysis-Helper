@@ -8,6 +8,7 @@ from uuid import uuid4
 from .queries import Scope
 from .database import open_dataset
 from .plans import scope_columns
+from .intents import temporal_intent, single_subject_candidate, VERSION as INTENT_VERSION
 
 MAPPING=Path(__file__).resolve().parent.parent/'config/question_fields.json'
 def identity(value):
@@ -46,8 +47,8 @@ def parse_question(question,scope):
             metrics.append(item)
     if re.search(r'\d',question) and not re.search(r'用户|crnti|小区|logicCellId',question,re.I): issues.append('数字含义未明确，请核对对象和范围')
     return {'scope':proposed,'metrics':metrics,'issues':issues,'mapping_hash':version,
-            'trend':any(w in question for w in ('趋势','变化','曲线','折线','时序'))}
-def confirm_request(directory,question,scope,metrics,trend):
+            'trend':temporal_intent(question), 'single_subject_candidate':single_subject_candidate(question)}
+def confirm_request(directory,question,scope,metrics,trend,single_subject=False):
     scope.where()
     for key in ('crnti','logic_cell_id','resource_id','phy_cell_inst'):
         value=getattr(scope,key)
@@ -66,6 +67,10 @@ def confirm_request(directory,question,scope,metrics,trend):
         'trend':bool(trend),'quality_policy':'EXCLUDE_ABNORMAL_RECORD','group_by':['logicCellId','ue_uid'],
         'chart':'OBSERVATION_LINE','bucket':'RAW_OBSERVATIONS','confirmed_at':datetime.now().isoformat(),
         'preflight':{'records':count,'cells':cells,'sessions':sessions,'unavailable_fields':[m for m in metrics if m not in available]}}
+    request['intent_version']=INTENT_VERSION
+    request['subject_assertion']=({'type':'USER_ASSERTED_SINGLE_SUBJECT','scope':scope_dict(scope),
+        'dataset_fingerprint':meta['dataset_fingerprint'],'source':'EXPLICIT_USER_CONFIRMATION',
+        'statement':question,'cross_segment_lines':False} if single_subject else None)
     request['request_hash']=identity(request)
     return request
 
@@ -74,4 +79,7 @@ def validate_request(request,meta,question,scope,check_mapping=True):
     if identity(content)!=request.get('request_hash'): raise ValueError('确认请求哈希不匹配')
     if request.get('version')!='analysis-request.v1' or request['question']!=question or request['scope']!=scope_dict(scope): raise ValueError('问题或范围已变化，请重新确认')
     if (request['dataset_id'],request['dataset_fingerprint'])!=(meta['dataset_id'],meta['dataset_fingerprint']): raise ValueError('数据版本已变化，请重新确认')
+    assertion=request.get('subject_assertion')
+    if assertion and (assertion.get('type')!='USER_ASSERTED_SINGLE_SUBJECT' or assertion.get('scope')!=request['scope'] or assertion.get('dataset_fingerprint')!=request['dataset_fingerprint'] or assertion.get('cross_segment_lines') is not False):
+        raise ValueError('身份说明超出本次确认范围')
     if check_mapping and request['mapping_hash']!=mapping()[1]: raise ValueError('字段语义已变化，请重新确认')

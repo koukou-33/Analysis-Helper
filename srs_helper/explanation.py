@@ -1,6 +1,9 @@
 """Structured explanation checks with safe, actionable diagnostic locations."""
 from .evidence import validate_numeric_claim
 from .performance import validation_event
+from .result_summary import read_summary
+from .evidence import verify_artifact
+import math
 
 UNITS = {'gain_avg':'dB','instBfSinrGain':'dB','comparison_diff':'dB',
          'rsrp_avg':'dBm','ni_avg':'dBm','usrRsrp':'dBm','srsUeNiDb':'dBm'}
@@ -35,16 +38,28 @@ def validate_explanation(output, artifacts, references):
         c['artifact_id'] = normalize_ref(c['artifact_id'],loc+'.artifact_id')
         if not isinstance(c['artifact_id'],str) or c['artifact_id'] not in known:
             fail('UNKNOWN_ARTIFACT',loc+'.artifact_id')
-        if not isinstance(c['column'],str) or c['column'] not in UNITS:
-            fail('UNSUPPORTED_CLAIM_COLUMN',loc+'.column')
-        if c['unit'] != UNITS[c['column']]:
-            fail('UNIT_MISMATCH',loc+'.unit')
+        artifact = known[c['artifact_id']]
+        summary = read_summary(artifact)
         if not isinstance(c['row_key'],dict) or not c['row_key']:
             fail('INVALID_ROW_KEY',loc+'.row_key')
-        if isinstance(c['value'],bool) or not isinstance(c['value'],(int,float)):
+        if isinstance(c['value'],bool) or not isinstance(c['value'],(int,float)) or not math.isfinite(c['value']):
             fail('INVALID_NUMERIC_VALUE',loc+'.value')
+        if summary and set(c['row_key'])=={'fact_id'}:
+            fact=next((f for f in summary['facts'] if f['fact_id']==c['row_key']['fact_id']),None)
+            if c['column']!='value' or not fact:
+                fail('UNSUPPORTED_CLAIM_COLUMN',loc+'.column')
+            if c['unit']!=fact['unit']: fail('UNIT_MISMATCH',loc+'.unit')
+            verify_artifact(artifact)
+            if not isinstance(fact['value'],(int,float)) or not math.isclose(fact['value'],c['value'],rel_tol=1e-9,abs_tol=1e-9):
+                fail('EVIDENCE_MISMATCH',loc)
+            continue
+        units = summary['column_units'] if summary else UNITS
+        if not isinstance(c['column'],str) or c['column'] not in units:
+            fail('UNSUPPORTED_CLAIM_COLUMN',loc+'.column')
+        if c['unit'] != units[c['column']]:
+            fail('UNIT_MISMATCH',loc+'.unit')
         try:
-            validate_numeric_claim(known[c['artifact_id']],c['row_key'],c['column'],c['value'],c['unit'],UNITS[c['column']])
+            validate_numeric_claim(artifact,c['row_key'],c['column'],c['value'],c['unit'],units[c['column']])
         except (ValueError,TypeError,KeyError):
             fail('EVIDENCE_MISMATCH',loc)
     if not isinstance(items,list) or len(items)>5:

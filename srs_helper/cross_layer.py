@@ -4,10 +4,11 @@ from .database import open_dataset
 from .plans import default_plan, export_relation
 
 
-def describe_cross_layer(directory,scope,question,fields,output_dir):
+def describe_cross_layer(directory,scope,question,fields,output_dir,trend=None):
     artifacts=[]
     Path(output_dir).mkdir(parents=True,exist_ok=True)
-    trend = '趋势' in question or 'trend' in question.lower()
+    from .intents import temporal_intent
+    if trend is None: trend = temporal_intent(question)
     hopping = '跳频' in question or 'hopping' in question.lower()
     if not trend and not hopping:
         return artifacts

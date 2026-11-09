@@ -319,6 +319,8 @@ def execute_plan(directory, scope, plan, output_dir, seconds=30):
         validate_plan_fields(plan,scope_columns(con))
         prepare_scope(con,scope,plan_fields(plan),include_stream=any(step.source=='stream' or step.other_source=='stream' for step in plan.steps))
         produced = {}
+        from .result_summary import summarize_relation, field_units
+        relation_units = {"resource":field_units(), "stream":field_units()}
         for step in plan.steps:
             source = step.source  # validated relation IDs only
             columns = {d[0] for d in con.execute(f'SELECT * FROM "{source}" LIMIT 0').description}
@@ -391,17 +393,26 @@ def execute_plan(directory, scope, plan, output_dir, seconds=30):
             # Only direct full-scope metrics qualify; filtered/derived relations need separate proof.
             result['metric_evidence'] = [dict(field=m.field,aggregate=m.aggregate,output=m.output,relation=step.source)
                                         for m in step.metrics] if step.operator=='GROUP_AGG' and step.source in {'resource','stream'} else []
+            relation_units[step.step_id] = summarize_relation(con,step.step_id,result,step,relation_units.get(source,field_units()))
             results.append(result)
     return results
 
 
-def export_relation(con, name, directory, plan, scope, operator):
+@measured('artifact_export')
+def export_relation(con, name, directory, plan, scope, operator, order_by=None):
     import hashlib
     aid = str(uuid4())
     path = directory / (aid+".parquet")
-    cursor = con.execute(f'SELECT * FROM "{name}"')
+    from .preview import CoveragePreview
+    columns = [r[0] for r in con.execute(f'DESCRIBE "{name}"').fetchall()]
+    ordering = order_by if order_by is not None else [k for k in ('logicCellId','ue_uid','event_ts','record_id','streamId') if k in columns]
+    order_sql = ' ORDER BY '+','.join(identifier(k,columns)+' ASC NULLS LAST' for k in ordering) if ordering else ''
+    sampler = CoveragePreview(columns)
+    keys = ','.join(identifier(k,columns) for k in sampler.keys)
+    total_groups = con.execute(f'SELECT count(*) FROM (SELECT DISTINCT {keys} FROM "{name}")').fetchone()[0] if keys else 1
+    cursor = con.execute(f'SELECT * FROM "{name}"'+order_sql)
     reader = cursor.fetch_record_batch(2048)
-    count,preview = 0,[]
+    count = 0
     inferred_count=0
     inferred_fields={name:0 for name in reader.schema.names if name.startswith("__cell_fill_")}
     with pq.ParquetWriter(path,reader.schema) as writer:
@@ -417,8 +428,7 @@ def export_relation(con, name, directory, plan, scope, operator):
             count += batch.num_rows
             if count > 1_000_000:
                 raise ValueError("Result exceeds one million rows; narrow the scope")
-            if len(preview)<100:
-                preview.extend(batch.slice(0,100-len(preview)).to_pylist())
+            for row in batch.to_pylist(): sampler.add(row)
             writer.write_batch(batch)
     with path.open("rb") as stream:
         digest = hashlib.file_digest(stream,"sha256").hexdigest()
@@ -428,5 +438,6 @@ def export_relation(con, name, directory, plan, scope, operator):
             "cell_parameter_policy":json.loads(con.execute("SELECT metadata FROM _etl_meta").fetchone()[0]).get("contract",{}).get("cell_parameter_policy"),
             "input_cohort_id":active_cohort_ref.get(),"query_plan":plan.model_dump(mode="json"),
             "dataset_id":plan.dataset_id,"dataset_fingerprint":plan.dataset_fingerprint,"plan_id":plan.plan_id,
-            "step_id":name,"operator":operator,"row_count":count,"preview":preview,"preview_truncated":count>100,
+            "step_id":name,"operator":operator,"row_count":count,"preview":sampler.rows(),"preview_truncated":count>len(sampler.rows()),
+            "preview_policy":sampler.metadata(total_groups),"order_by":ordering,
             "scope":scope.__dict__,"quality_policy":plan.quality_policy}

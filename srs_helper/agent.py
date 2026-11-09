@@ -29,6 +29,7 @@ from .plans import QueryPlan, default_plan, execute_plan, scope_columns, validat
 from .queries import Scope, summarize
 from .services import ModelService, ServiceConfig, ServiceError, extract_feature, call_model, model_budget
 from .sessions import SessionStore, dumps
+from .progress import ActionProgress, StorageFailure
 from .sql_executor import execute_sql
 from .charts import time_series_artifact, metric_time_series
 from .question_scope import validate_request
@@ -37,6 +38,7 @@ from .prompts import EXPLAIN_SYSTEM, PLAN_SYSTEM, VERIFY_SYSTEM, PROMPT_VERSION,
 from .verification_loop import VerificationLoop, TaskProposal, loop_report, predicate_label
 from .state_analysis import state_analysis
 from .reporting import feature_report
+from .result_summary import summary_report, limitations_for, model_evidence, bounded_explanation_context
 from .visual import compare_visual
 
 
@@ -113,7 +115,10 @@ class DiagnosticEngine:
                 with bind_cohort(cohort):
                     return self._run(session,question,scope,action_id,feature_path,progress,plan_override,sql_override,peer_comparison,parent,cohort,confirmed_request)
             except Exception:
-                self.store.fail(sid,action_id)
+                try:
+                    self.store.fail(sid,action_id)
+                except Exception:
+                    pass  # Preserve the original failure, including storage failures.
                 raise
 
     def _run(self,session,question,scope,action_id,feature_path,progress,plan_override,sql_override,peer_comparison,parent=None,inherited_cohort=None,confirmed_request=None):
@@ -131,8 +136,8 @@ class DiagnosticEngine:
         context['parent_event_id']=inherited_cohort.get('event_id') if inherited_cohort else None
         folder = self.store.directory(sid)/"artifacts"
         folder.mkdir(parents=True,exist_ok=True)
-        journal_path = folder/('progress_'+hashlib.sha256(action_id.encode()).hexdigest()+'.json')
-        journal = json.loads(journal_path.read_text(encoding='utf-8')) if journal_path.exists() else {}
+        recovery = ActionProgress(self.store,sid,action_id,folder)
+        journal = recovery.data
         budget = journal.get("budget") or analysis_budget()
         budget.setdefault('model_calls_limit',int(os.getenv('SRS_ANALYSIS_MAX_MODEL_CALLS','12')))
         budget.setdefault('semantic_seconds',float(os.getenv('SRS_RETRIEVAL_SEMANTIC_SECONDS','10')))
@@ -141,10 +146,7 @@ class DiagnosticEngine:
         if not 0<=budget['semantic_seconds']<=60:
             raise ValueError('Invalid semantic retrieval budget')
         def save_progress(**updates):
-            journal.update(updates)
-            pending = journal_path.with_suffix('.tmp')
-            pending.write_text(dumps(journal),encoding='utf-8')
-            os.replace(pending,journal_path)
+            recovery.save(**updates)
         operation_started=journal.get('budget_started',time.time())
         save_progress(budget_started=operation_started,budget=budget)
         def remaining():
@@ -171,7 +173,10 @@ class DiagnosticEngine:
                     stages=dict(journal.get('stage_seconds',{}))
                     stages[name]=round(stages.get(name,0)+time.monotonic()-started,6)
                     statuses=dict(journal.get("stage_status",{})); statuses[name]=status
-                    save_progress(stage_seconds=stages,stage_status=statuses)
+                    try:
+                        save_progress(stage_seconds=stages,stage_status=statuses)
+                    except StorageFailure:
+                        validation_event('stage_telemetry',1,{'code':'STORAGE_FAILURE','node':name})
                     if progress: progress(f"{name}：{status}（{stages[name]:.2f}秒累计）")
             return measured('agent_'+name)(run)
         def budgeted_model(messages, purpose):
@@ -323,7 +328,7 @@ class DiagnosticEngine:
                 ephemeral['peers'] = {'status':'QUERY_FAILED','reason':type(exc).__name__,'artifacts':[]}
                 notices.append('同侪比较未完成，已保留其他事实。')
             try:
-                artifacts.extend(describe_cross_layer(session['dataset_dir'],scope,question,[r['field'] for r in state['requirements']],folder))
+                artifacts.extend(describe_cross_layer(session['dataset_dir'],scope,question,[r['field'] for r in state['requirements']],folder,trend=confirmed_request['trend'] if confirmed_request else None))
             except Exception as exc:
                 notices.append('跨层描述统计未完成（'+type(exc).__name__+'）。')
             try:
@@ -510,6 +515,16 @@ class DiagnosticEngine:
                 if a["operator"]=="METRIC_TIME_SERIES":
                     t=a["statistics"]
                     answer+=f"\n{a['field']}：完整范围共 {t['points']} 个观测时点，{t['valid_points']} 个时点有唯一有效值；最小/最大值 {t['minimum']} / {t['maximum']}。时间覆盖 {t['start']} 至 {t['end']}。使用原始数值，不推断距离或持续变化；分小区与会话查看折线图。"
+                    for group in a.get('group_statistics',[])[:20]:
+                        answer+=f"\n小区 {group['logicCellId']} / 会话 {group['ue_uid']}：有效时点 {group['valid_points']}，首末有效值 {group['first_value']} → {group['last_value']}，极值 {group['minimum']} / {group['maximum']}。"
+                    if len(a.get('group_statistics',[]))>20:
+                        answer+='\n正文仅列出前20个会话，完整分组统计在证据画布查看；不代表其他会话不存在。'
+            general_report=summary_report(ephemeral['artifacts'])
+            if general_report: answer+='\n\n'+general_report
+            restrictions=limitations_for(state.get('plan'),ephemeral['artifacts'])
+            if restrictions: answer+='\n\n分析限制：\n'+'\n'.join('- '+v for v in restrictions)
+            if (confirmed_request or {}).get('subject_assertion'):
+                answer+='\n依据用户本次确认：当前范围内的 CRNTI 属于同一用户。保留各小区及接入会话分段，段间不连线；这不是数据自动证明的身份。'
             if not s["flow_valid_count"]:
                 answer += " 当前范围无数据，不能据此确认或排除根因。"
             missing_gains = gains_missing(s)
@@ -548,12 +563,13 @@ class DiagnosticEngine:
                 ephemeral['model_status']['explain']='BLOCKED_INCONSISTENT_EVIDENCE'
                 notices.append('特性证据一致性校验失败，暂停模型解释，保留独立基础统计。')
             if not unfinished_verification and feature_consistent and self.model.config.configured and ephemeral["artifacts"] and s["business_valid_count"] and (not state["requirements"] or any(r["status"]=="COVERED" for r in state["requirements"])):
-                evidence = [{"artifact_id":a["artifact_id"],"row_count":a["row_count"],"preview":a["preview"][:10]} for a in ephemeral["artifacts"]]
+                evidence = model_evidence(ephemeral['artifacts'])
                 messages = [SystemMessage(content=EXPLAIN_SYSTEM),
-                            HumanMessage(content=dumps({"question":question,"evidence":evidence,"feature_summary":ephemeral.get("feature"),"session_states":ephemeral.get("session_states"),"business_goals":state["goals"],"verification_contract":TaskProposal.model_json_schema(),"verification_state":ephemeral["loop"].planner_payload(),"knowledge":state["refs"],"case_assessments":ephemeral["case_assessments"],"requirements":state["requirements"],"allowed_claim_columns_and_units":UNITS}))]
+                            HumanMessage(content=dumps({"question":question,"evidence":evidence["artifacts"],"evidence_coverage":{k:v for k,v in evidence.items() if k!="artifacts"},"subject_assertion":(confirmed_request or {}).get("subject_assertion"),"plan_limitations":limitations_for(state.get("plan"),ephemeral["artifacts"]),"feature_summary":ephemeral.get("feature"),"session_states":ephemeral.get("session_states"),"business_goals":state["goals"],"verification_contract":TaskProposal.model_json_schema(),"verification_state":ephemeral["loop"].planner_payload(),"knowledge":state["refs"],"case_assessments":ephemeral["case_assessments"],"requirements":state["requirements"],"legacy_claim_columns_and_units":UNITS}))]
                 messages[0].content += FOUR_STREAM_POLICY
                 for attempt in range(3):
                     try:
+                        messages[1].content=bounded_explanation_context(json.loads(messages[1].content))
                         output = budgeted_model(messages,'explain')
                         claims,hypotheses = validate_explanation(output,ephemeral["artifacts"],state["refs"])
                         ephemeral['model_status']['explain']='SUCCEEDED'
@@ -568,7 +584,7 @@ class DiagnosticEngine:
                         validation_event("explanation_validation",attempt+1,details)
                         ephemeral["validation_errors"].append({"stage":"explanation","attempt":attempt+1,**details})
                         messages.append(HumanMessage(content="上次失败输出（可能截短）："+dumps(output)[:8000]))
-                        messages.append(HumanMessage(content="解释校验失败："+dumps(details)+"。修复对应字段；无证据的 claims/hypotheses 请删去，允许空列表。允许的数值列及单位："+dumps(UNITS)))
+                        messages.append(HumanMessage(content="解释校验失败："+dumps(details)+"。修复对应字段；无证据的 claims/hypotheses 请删去，允许空列表。新产物以对应摘要facts及column_units为准；旧产物允许的数值列及单位："+dumps(UNITS)))
                         if attempt==2:
                             notices.append("模型解释未通过证据校验（"+exc.code+"，"+exc.location+"），只发布确定性事实表。")
             ephemeral["responsibility_evidence"] = []
@@ -655,12 +671,12 @@ class DiagnosticEngine:
             with model_budget(remaining()):
                 final = compiled.invoke({"question":question,"action_id":action_id,"scope":json.loads(dumps(scope.__dict__)),
                                      "artifact_refs":[],"refs":[],"notices":[],"steps":[]},
-                                    {"configurable":{"thread_id":sid},"recursion_limit":96})
+                                    {"configurable":{"thread_id":sid+':'+action_id},"recursion_limit":96})
         finally:
             connection.close()
         result = {"confirmed_request":confirmed_request,"session_id":sid,"action_id":action_id,"question":question,"scope":scope.__dict__,
                   "dataset_id":meta["dataset_id"],"dataset_fingerprint":meta["dataset_fingerprint"],
-                  "answer":final["answer"],"notices":final["notices"],"status":final["status"],"model_status":ephemeral["model_status"],
+                  "answer":final["answer"],"limitations":limitations_for(final.get('plan'),ephemeral['artifacts']),"notices":final["notices"],"status":final["status"],"model_status":ephemeral["model_status"],
                   "verification_loop":final["loop_state"],"budget_diagnostics":budget_diagnostics(),"session_states":ephemeral.get("session_states",{}),"prompt_version":PROMPT_VERSION,"analysis_context":context,"inherited_artifacts":(parent.get("artifacts",[])+([inherited_cohort] if inherited_cohort and inherited_cohort.get("event_id") else [])) if parent else [],"route":final['route'],"goals":final['goals'],
                   "feature_binding":({'path':ephemeral['selected_feature']['path'],'version':ephemeral['selected_feature']['version'],
                                       'rule_hash':identity(ephemeral['selected_feature']['metadata'])} if ephemeral.get('selected_feature') else {}),

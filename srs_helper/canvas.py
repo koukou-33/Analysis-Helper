@@ -7,6 +7,7 @@ OPERATORS = {
     'CONDITION_COUNT':'统计条件满足、不满足和未知的条目',
     'CONDITION_ROWS':'逐条核对条件', 'COMPARE':'比较字段分布',
     'TIME_SLICE':'筛选指定时间范围', 'TEMPORAL_RELATE':'关联时间邻近的观测',
+    'METRIC_TIME_SERIES':'查看指标随时间的观测',
     'TIME_SERIES':'按时间统计测量值', 'SESSION_OBSERVATIONS':'查看会话状态观测',
     'OBSERVED_CHANGES':'核对状态变化前后的条件', 'SESSION_STATES':'汇总会话观测状态',
     'condition_evaluated_rows':'逐条核对条件',
