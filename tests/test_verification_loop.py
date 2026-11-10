@@ -20,6 +20,8 @@ class ScriptedModel:
         self.planner_calls=0
         self.explain_calls=0
     def chat_json(self,messages):
+        if '分析工具调度器' in messages[0].content:
+            return {'action':'finish','purpose':'已有规则任务覆盖本题'}
         payload=json.loads(messages[1].content)
         if 'response_schema' in payload:
             self.planner_calls+=1
@@ -138,20 +140,21 @@ class VerificationLoopTests(unittest.TestCase):
             result=self.run_model(ScriptedModel(plan))
         self.assertEqual(query.call_count,2)
         self.assertEqual([a['status'] for a in result['verification_loop']['assessments']],['REFUTED','SUPPORTED'])
-        self.assertEqual(result['steps'].count('loop_execute'),2)
+        self.assertEqual(result['analysis_steps'].count('loop_execute'),2)
         self.assertEqual(result['verification_loop']['stop_reason'],'GOALS_VERIFIED')
         self.assertIn('条件判断被反驳',result['answer'])
         self.assertTrue(all(a['references'] for a in result['hypotheses']))
         self.assertTrue(all(a['parent_artifact_ids'] for a in result['artifacts'] if a.get('origin')=='VERIFICATION_LOOP'))
 
-    def test_final_explanation_reenters_queries_not_published_as_fact(self):
+    def test_final_explanation_cannot_reenter_or_publish_new_hypothesis(self):
         model=ScriptedModel(explanation=lambda p:{'claims':[],'hypotheses':[{
             'text':'错误的自然语言结论，不能原样发布','references':[p['evidence'][0]['artifact_id']],
             'verification':proposal()}]})
         result=self.run_model(model)
-        self.assertEqual(model.explain_calls,1)
-        self.assertEqual(result['steps'].count('completion_gate'),2)
-        self.assertEqual(result['verification_loop']['assessments'][0]['status'],'REFUTED')
+        self.assertEqual(model.explain_calls,3)
+        self.assertNotIn('completion_gate',result['steps'])
+        self.assertEqual(result['verification_loop']['assessments'],[])
+        self.assertEqual(result['output_status'],'PARTIAL')
         self.assertNotIn('错误的自然语言结论',result['answer'])
         self.assertNotIn('错误的自然语言结论',str(result['hypotheses']))
 
@@ -228,7 +231,8 @@ class VerificationLoopTests(unittest.TestCase):
         model=ScriptedModel(explanation=lambda p:{'claims':[],'hypotheses':[{
             'text':'互斥可能导致关闭','references':[p['evidence'][0]['artifact_id']]}]})
         result=self.run_model(model)
-        self.assertEqual(result['verification_loop']['stop_reason'],'NO_PROGRESS')
+        self.assertEqual(result['verification_loop']['stop_reason'],'GOALS_VERIFIED')
+        self.assertEqual(result['output_status'],'PARTIAL')
         self.assertEqual(result['hypotheses'],[])
         self.assertEqual(result['verification_loop']['missing_information'],[])
 

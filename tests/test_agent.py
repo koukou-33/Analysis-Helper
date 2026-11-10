@@ -29,7 +29,7 @@ class AgentTests(unittest.TestCase):
         aid = str(uuid4())
         first = engine.run(sid,"查看四流增益",Scope(logic_cell_id=0),aid)
         self.assertEqual(first["summary"]["flow_valid_count"],40)
-        self.assertEqual(first["steps"],["retrieve","route","requirements","plan","execute","feature","states","coverage","verify","goals","loop_prepare","loop_plan","report","explain","completion_gate","finalize"])
+        self.assertEqual(first["steps"],["plan","agent_loop","explain","report"])
         reopened = DiagnosticEngine(storage,self.root/"empty_assets",model=ModelService(ServiceConfig()))
         same = reopened.run(sid,"查看四流增益",Scope(logic_cell_id=0),aid)
         self.assertEqual(same,first)
@@ -76,6 +76,8 @@ class AgentTests(unittest.TestCase):
             config = ServiceConfig(provider='local_openai',base_url='http://example',model='test')
             calls = 0
             def chat_json(self,messages):
+                if '分析工具调度器' in messages[0].content:
+                    return {'action':'finish','purpose':'已有统计，无额外工具任务'}
                 self.calls += 1
                 if self.calls == 1:
                     plan = default_plan(parent.normal_meta,'增益').model_dump(mode='json')

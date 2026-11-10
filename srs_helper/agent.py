@@ -40,6 +40,8 @@ from .state_analysis import state_analysis
 from .reporting import feature_report
 from .result_summary import summary_report, limitations_for, model_evidence, bounded_explanation_context
 from .visual import compare_visual
+from .analysis_bundle import GRAPH_VERSION, freeze_bundle, read_bundle, report_index, publish_json, read_output
+from .expert_tools import run_tools, TOOL_SYSTEM
 
 
 class DiagnosticState(TypedDict, total=False):
@@ -62,6 +64,9 @@ class DiagnosticState(TypedDict, total=False):
     loop_ready: bool
     loop_reenter: bool
     loop_state: dict
+    evidence_bundle: dict
+    analysis_steps: list[str]
+    analysis_plan: dict
 
 
 def restore_scope(data):
@@ -138,6 +143,11 @@ class DiagnosticEngine:
         folder.mkdir(parents=True,exist_ok=True)
         recovery = ActionProgress(self.store,sid,action_id,folder)
         journal = recovery.data
+        if journal.get('graph_version') not in {None, GRAPH_VERSION}:
+            raise ValueError('Unsupported graph version; start a new analysis')
+        legacy_graph = bool(journal) and journal.get("graph_version") != GRAPH_VERSION
+        if not legacy_graph:
+            recovery.save(graph_version=GRAPH_VERSION)
         budget = journal.get("budget") or analysis_budget()
         budget.setdefault('model_calls_limit',int(os.getenv('SRS_ANALYSIS_MAX_MODEL_CALLS','12')))
         budget.setdefault('semantic_seconds',float(os.getenv('SRS_RETRIEVAL_SEMANTIC_SECONDS','10')))
@@ -147,12 +157,19 @@ class DiagnosticEngine:
             raise ValueError('Invalid semantic retrieval budget')
         def save_progress(**updates):
             recovery.save(**updates)
+        budget.setdefault('output_reserve_seconds',min(float(os.getenv('SRS_OUTPUT_RESERVE_SECONDS','15')),budget['seconds']) if not legacy_graph else 0)
         operation_started=journal.get('budget_started',time.time())
         save_progress(budget_started=operation_started,budget=budget)
-        def remaining():
+        reserve_seconds = budget['output_reserve_seconds']
+        if not 0 <= reserve_seconds <= budget['seconds']:
+            raise ValueError('Invalid output reserve')
+        def total_remaining():
             return max(0,budget['seconds']-(time.time()-operation_started))
+        def remaining():
+            reserved = reserve_seconds if journal.get('phase') not in {'EXPLAIN','REPORT','DONE'} else 0
+            return max(0,total_remaining()-reserved)
         def budget_diagnostics():
-            return {'total_seconds':budget['seconds'],
+            return {'total_seconds':budget['seconds'],'output_reserve_seconds':reserve_seconds,
                     'elapsed_seconds':round(max(0,time.time()-operation_started),3),
                     'remaining_seconds':round(remaining(),3),
                     'loop_entry_remaining_seconds':journal.get('loop_entry_remaining_seconds'),
@@ -186,7 +203,8 @@ class DiagnosticEngine:
                 exc.budget_dimension='TIME' if remaining()<=0 else 'MODEL_CALLS'
                 raise exc
             save_progress(model_calls=count+1)
-            return call_model(self.model,messages,purpose)
+            with model_budget(remaining()):
+                return call_model(self.model,messages,purpose)
         ephemeral = {"validation_errors": [], "model_status":{"plan":"NOT_RUN","explain":"NOT_RUN"}}  # full results live in files, not LangGraph checkpoints
         def announce(name):
             if progress:
@@ -392,7 +410,7 @@ class DiagnosticEngine:
             notices = list(state['notices'])
             rounds = state['backfill_rounds']
             # Hard total budget and finite batches; no free SQL or model-expanded requirements.
-            while rounds < budget['rounds'] and time.time()-state['budget_started'] < budget['seconds']:
+            while rounds < budget['rounds'] and time.time()-state['budget_started'] < budget['seconds']-reserve_seconds:
                 plan = backfill_plan(meta,question,requirements,limit=budget["fields"])
                 if plan is None or sql_override is not None:
                     break
@@ -400,7 +418,7 @@ class DiagnosticEngine:
                 save_progress(rounds=rounds,requirements=requirements)
                 before = [(r['id'],r['status']) for r in requirements]
                 try:
-                    remaining = max(0.1,budget['seconds']-(time.time()-state['budget_started']))
+                    remaining = max(0.1,budget['seconds']-reserve_seconds-(time.time()-state['budget_started']))
                     new = execute_plan(session['dataset_dir'],scope,plan,folder,seconds=min(30,remaining))
                     for artifact in new:
                         artifact['origin'] = 'COVERAGE_BACKFILL'
@@ -452,7 +470,7 @@ class DiagnosticEngine:
         def loop_prepare(state):
             announce('建立验证任务与残余群体')
             if 'loop_entry_remaining_seconds' not in journal:
-                save_progress(loop_entry_remaining_seconds=round(remaining(),3))
+                save_progress(loop_entry_remaining_seconds=round(total_remaining(),3),loop_entry_analysis_seconds=round(remaining(),3))
             loop=VerificationLoop(directory=session['dataset_dir'],scope=scope,meta=meta,context=context,
                 columns=columns,folder=folder,artifacts=ephemeral['artifacts'],feature=ephemeral.get('feature'),
                 goals=state['goals'],question=question,remaining=remaining,
@@ -542,7 +560,7 @@ class DiagnosticEngine:
 
         def explain(state):
             announce('整理可选模型解释')
-            answer=state['answer']
+            answer=state.get('answer', '')
             s=ephemeral['summary']
             missing_gains=gains_missing(s)
             notices = list(state["notices"])
@@ -567,11 +585,15 @@ class DiagnosticEngine:
                 messages = [SystemMessage(content=EXPLAIN_SYSTEM),
                             HumanMessage(content=dumps({"question":question,"evidence":evidence["artifacts"],"evidence_coverage":{k:v for k,v in evidence.items() if k!="artifacts"},"subject_assertion":(confirmed_request or {}).get("subject_assertion"),"plan_limitations":limitations_for(state.get("plan"),ephemeral["artifacts"]),"feature_summary":ephemeral.get("feature"),"session_states":ephemeral.get("session_states"),"business_goals":state["goals"],"verification_contract":TaskProposal.model_json_schema(),"verification_state":ephemeral["loop"].planner_payload(),"knowledge":state["refs"],"case_assessments":ephemeral["case_assessments"],"requirements":state["requirements"],"legacy_claim_columns_and_units":UNITS}))]
                 messages[0].content += FOUR_STREAM_POLICY
+                if not legacy_graph:
+                    messages[0].content += '\n证据已冻结。不得提出新的原因假设或查询，hypotheses只能逐字引用已有评估，否则返回空列表。'
                 for attempt in range(3):
                     try:
                         messages[1].content=bounded_explanation_context(json.loads(messages[1].content))
                         output = budgeted_model(messages,'explain')
                         claims,hypotheses = validate_explanation(output,ephemeral["artifacts"],state["refs"])
+                        if not legacy_graph and any(h['text'] not in {a['text'] for a in ephemeral.get('frozen_hypotheses',[])} for h in hypotheses):
+                            raise ExplanationError('NEW_HYPOTHESIS_AFTER_FREEZE','hypotheses')
                         ephemeral['model_status']['explain']='SUCCEEDED'
                         ephemeral["claims"] = claims
                         break
@@ -598,7 +620,7 @@ class DiagnosticEngine:
                             'evidence_status':requirement['status'],'source':doc['path'],'version':doc['version'],
                             'interpretation':'仅用于排查方向，不确认根因或免责'})
             ephemeral["hypotheses"] = hypotheses
-            ephemeral["visual"] = ({"status":"NOT_RUN","reason":"验证未完成，暂停可选视觉解释。"} if unfinished_verification else {"status":"NOT_RUN","reason":"当前问题没有可用的增益图比对需求或样本。"} if missing_gains or not any(r["field"]=="instBfSinrGain" for r in state["requirements"])
+            ephemeral["visual"] = ephemeral.get("visual", {}) if not legacy_graph else ({"status":"NOT_RUN","reason":"验证未完成，暂停可选视觉解释。"} if unfinished_verification else {"status":"NOT_RUN","reason":"当前问题没有可用的增益图比对需求或样本。"} if missing_gains or not any(r["field"]=="instBfSinrGain" for r in state["requirements"])
                                   else compare_visual(self.vision,s,ephemeral["documents"],self.index,folder))
             save_progress(explanation_complete=True,claims=ephemeral.get('claims',[]),hypotheses=hypotheses,
                 explain_status=ephemeral['model_status']['explain'],responsibility_evidence=ephemeral['responsibility_evidence'],visual=ephemeral['visual'])
@@ -641,34 +663,172 @@ class DiagnosticEngine:
                 'status':'FACTS_READY' if loop.state.stop_reason=='GOALS_VERIFIED' else 'PARTIAL_FACTS_READY',
                 'steps':state['steps']+['finalize']}
 
-        graph = StateGraph(DiagnosticState)
-        nodes = [("retrieve",retrieve),("route",route_node),("requirements",requirements_node),("plan",plan_node),
-            ("execute",execute),("feature",feature_node),("states",states_node),("coverage",coverage_node),
-            ("verify",verify),("goals",goals_node),("loop_prepare",loop_prepare),("loop_plan",loop_plan),
-            ("loop_execute",loop_execute),("loop_evaluate",loop_evaluate),("report",report_node),
-            ("explain",explain),("completion_gate",completion_gate),("finalize",finalize)]
-        for name,node in nodes:
-            graph.add_node(name,timed_node(name,node))
-        graph.add_node('rule_plan',timed_node('rule_plan',plan_node))
-        graph.add_edge(START,'retrieve')
-        chain=['retrieve','route','requirements']
-        for a,b in zip(chain,chain[1:]):
-            graph.add_edge(a,b)
-        graph.add_conditional_edges('requirements',lambda state:'rule_plan' if state['route']=='FEATURE' else 'plan',
-                                    {'rule_plan':'rule_plan','plan':'plan'})
-        graph.add_edge('rule_plan','execute'); graph.add_edge('plan','execute')
-        chain=['execute','feature','states','coverage','verify','goals','loop_prepare','loop_plan']
-        for a,b in zip(chain,chain[1:]):
-            graph.add_edge(a,b)
-        graph.add_conditional_edges('loop_plan',lambda state:'loop_execute' if state['loop_ready'] else 'report')
-        graph.add_edge('loop_execute','loop_evaluate'); graph.add_edge('loop_evaluate','loop_plan')
-        graph.add_edge('report','explain'); graph.add_edge('explain','completion_gate')
-        graph.add_conditional_edges('completion_gate',lambda state:'loop_plan' if state['loop_reenter'] else 'finalize')
-        graph.add_edge('finalize',END)
+        def apply_stage(state, name, fn):
+            state.update(timed_node(name, fn)(state))
+
+        def initial_plan(state):
+            if journal.get('evidence_bundle'):
+                frozen = read_bundle(journal['evidence_bundle'])
+                ephemeral.update(frozen['evidence'])
+                context.update(frozen['context'])
+                return {**frozen['state'], 'evidence_bundle':journal['evidence_bundle']}
+            return {'steps':['plan'], 'answer':'', 'analysis_plan':{'question':question,
+                'parent_question':parent.get('question') if parent else None,
+                'context':context, 'scope':json.loads(dumps(scope.__dict__)),
+                'metrics':(confirmed_request or {}).get('metrics',[]),
+                'completion_criteria':'逐目标核验实际证据、业务规则、覆盖与残余缺口；空队列不代表根因确认'}}
+
+        def agent_loop(state):
+            if journal.get('evidence_bundle'):
+                frozen = read_bundle(journal['evidence_bundle'])
+                ephemeral.update(frozen['evidence'])
+                context.update(frozen['context'])
+                state.update(frozen['state'])
+                apply_stage(state,'loop_prepare',loop_prepare)
+                ephemeral['frozen_hypotheses']=frozen['evidence'].get('hypotheses',[])
+                return {**frozen['state'], 'evidence_bundle':journal['evidence_bundle']}
+            state=dict(state)
+            for name, fn in [('retrieve',retrieve),('route',route_node),('requirements',requirements_node),
+                             ('plan_queries',plan_node),('execute',execute),('feature',feature_node),
+                             ('states',states_node),('coverage',coverage_node),('verify',verify),('goals',goals_node)]:
+                apply_stage(state,name,fn)
+            def analysis_remaining(): return remaining()
+            if journal.get('tool_documents'):
+                ephemeral['documents']=journal['tool_documents']
+                state['refs']=journal['tool_refs']
+            if self.model.config.configured and sql_override is None and plan_override is None and not (state['route']=='FEATURE' and all(g['status']=='VERIFIED' for g in state['goals']) and not any(w in question for w in ('原因','为什么','条件','排查','验证','假设'))) and (not state['requirements'] or any(r['status']=='COVERED' for r in state['requirements'])):
+                def propose(payload):
+                    return budgeted_model([SystemMessage(content=TOOL_SYSTEM+FOUR_STREAM_POLICY),
+                                           HumanMessage(content=dumps(payload))],'tools')
+                def query_tool(plan):
+                    validate_plan_fields(plan,columns)
+                    if (plan.dataset_id,plan.dataset_fingerprint)!=(meta['dataset_id'],meta['dataset_fingerprint']):
+                        raise ValueError('Wrong dataset')
+                    produced=execute_plan(session['dataset_dir'],scope,plan,folder,seconds=max(.001,min(30,analysis_remaining())))
+                    for artifact in produced:
+                        verify_artifact(artifact)
+                        artifact['origin']='EXPERT_TOOL'
+                    ephemeral['artifacts'].extend(produced)
+                    state['requirements']=audit_requirements(state['requirements'],ephemeral['artifacts'],columns)
+                    state.update(goals_node(state))
+                    return [a['artifact_id'] for a in produced]
+                def search_tool(text):
+                    docs, mode=self.index.search(text,embedder=None)
+                    for doc in docs:
+                        if not any(d['path']==doc['path'] and d['version']==doc['version'] for d in ephemeral['documents']):
+                            ephemeral['documents'].append(doc)
+                            state['refs'].append({'path':doc['path'],'version':doc['version'],'kind':doc['kind'],
+                                                  'title':doc.get('title',doc['path']),'excerpt':doc.get('body','')[:8000]})
+                    return [d['path'] for d in docs]
+                def persist_tools(ledger):
+                    save_progress(tool_ledger=ledger,artifacts=ephemeral['artifacts'],requirements=state['requirements'],
+                                  tool_documents=ephemeral['documents'],tool_refs=state['refs'])
+                ledger=run_tools(propose=propose,
+                    payload=lambda:{'question':question,'context':context,'columns':columns,
+                                    'goals':state['goals'],'evidence':model_evidence(ephemeral['artifacts']),
+                                    'knowledge':state['refs'],'parent_question':parent.get('question') if parent else None},
+                    query=query_tool,search=search_tool,save=persist_tools,
+                    restored=journal.get('tool_ledger'),remaining=analysis_remaining)
+                ephemeral['tool_ledger']=ledger
+            apply_stage(state,'loop_prepare',loop_prepare)
+            while True:
+                apply_stage(state,'loop_plan',loop_plan)
+                if not state['loop_ready']: break
+                apply_stage(state,'loop_execute',loop_execute)
+                apply_stage(state,'loop_evaluate',loop_evaluate)
+            if ephemeral.get('tool_ledger') and ephemeral['tool_ledger'][-1]['status'] in {'FAILED','NO_PROGRESS'}:
+                task=ephemeral['tool_ledger'][-1]
+                reason='BUDGET_EXHAUSTED' if task.get('error')=='BUDGET_EXHAUSTED' else 'NO_PROGRESS' if task['status']=='NO_PROGRESS' else 'TECHNICAL_FAILURE'
+                ephemeral['loop'].stop(reason,'动态工具分析未完成；保留已有证据')
+            ephemeral['visual']={'status':'NOT_RUN','reason':'无当前问题所需的视觉取证或预算'}
+            if analysis_remaining()>0 and not gains_missing(ephemeral['summary']) and any(r['field']=='instBfSinrGain' for r in state['requirements']):
+                ephemeral['visual']=compare_visual(self.vision,ephemeral['summary'],ephemeral['documents'],self.index,folder)
+            state.setdefault('answer','')
+            apply_stage(state,'finalize_analysis',finalize)
+            ephemeral['frozen_hypotheses']=ephemeral.get('hypotheses',[])
+            state['analysis_steps']=list(state['steps'])
+            state['steps']=['plan','agent_loop']
+            keys=['summary','artifacts','feature','session_states','documents','selected_feature','peers',
+                  'case_assessments','hypotheses','frozen_hypotheses','visual','tool_ledger']
+            ref=freeze_bundle(folder,{'graph_version':GRAPH_VERSION,'analysis_id':action_id,'context':context,
+                'question':question,'parent_bundle':parent.get('evidence_bundle') if parent else None,
+                'parent_question':parent.get('question') if parent else None,
+                'state':state,'evidence':{k:ephemeral[k] for k in keys if k in ephemeral}})
+            save_progress(evidence_bundle=ref,phase='EXPLAIN',loop_state=state['loop_state'])
+            return {**state,'evidence_bundle':ref}
+
+        def frozen_explain(state):
+            frozen=read_bundle(state['evidence_bundle'])
+            ephemeral.update(frozen['evidence'])
+            if journal.get('explanation_ref'):
+                saved=read_output(journal['explanation_ref'])
+                if saved['bundle'] != state['evidence_bundle']:
+                    raise ValueError('Explanation belongs to a different bundle')
+                ephemeral.update(claims=saved['claims'],hypotheses=saved['hypotheses'],
+                                 explanation_ref=journal['explanation_ref'],
+                                 responsibility_evidence=journal.get('responsibility_evidence',[]))
+                ephemeral['model_status']['explain']=saved['model_status']
+                return {'status':frozen['state']['status'],'steps':state['steps']+['explain']}
+            result=explain(state)
+            # Predicate assessments are fixed before explanation; prose cannot replace them.
+            ephemeral['hypotheses']=frozen['evidence'].get('hypotheses',[])
+            result['status']=frozen['state']['status']
+            explanation_payload={'schema_version':'explanation.v1','bundle':state['evidence_bundle'],
+                'claims':ephemeral.get('claims',[]),'hypotheses':ephemeral['hypotheses'],
+                'model_status':ephemeral['model_status']['explain'],'limitations':state['notices']}
+            ephemeral['explanation_ref']=publish_json(folder,explanation_payload,'explanation')
+            save_progress(phase='REPORT',explanation_ref=ephemeral['explanation_ref'])
+            return result
+
+        def final_report(state):
+            frozen=read_bundle(state['evidence_bundle'])
+            result=report_node(state)
+            result['answer']+='\n\n'+loop_report(frozen['state']['loop_state'])
+            index=report_index(frozen,ephemeral.get('claims',[]))
+            ephemeral['report_index']=index
+            result['answer']+='\n\n分析证据：\n'+'\n'.join(
+                '- '+a['artifact_id']+'：'+str(a.get('operator',''))+'（完整数据与来源见证据详情）'
+                for a in frozen['evidence']['artifacts'])
+            ephemeral['report_ref']=publish_json(folder,{'schema_version':'report.v1','bundle':state['evidence_bundle'],
+                'explanation':ephemeral.get('explanation_ref'),'answer':result['answer'],'index':index},'report')
+            save_progress(phase='DONE',report_index=index,report_ref=ephemeral['report_ref'])
+            return result
+
+        if legacy_graph:
+            graph = StateGraph(DiagnosticState)
+            nodes = [("retrieve",retrieve),("route",route_node),("requirements",requirements_node),("plan",plan_node),
+                ("execute",execute),("feature",feature_node),("states",states_node),("coverage",coverage_node),
+                ("verify",verify),("goals",goals_node),("loop_prepare",loop_prepare),("loop_plan",loop_plan),
+                ("loop_execute",loop_execute),("loop_evaluate",loop_evaluate),("report",report_node),
+                ("explain",explain),("completion_gate",completion_gate),("finalize",finalize)]
+            for name,node in nodes:
+                graph.add_node(name,timed_node(name,node))
+            graph.add_node('rule_plan',timed_node('rule_plan',plan_node))
+            graph.add_edge(START,'retrieve')
+            chain=['retrieve','route','requirements']
+            for a,b in zip(chain,chain[1:]):
+                graph.add_edge(a,b)
+            graph.add_conditional_edges('requirements',lambda state:'rule_plan' if state['route']=='FEATURE' else 'plan',
+                                        {'rule_plan':'rule_plan','plan':'plan'})
+            graph.add_edge('rule_plan','execute'); graph.add_edge('plan','execute')
+            chain=['execute','feature','states','coverage','verify','goals','loop_prepare','loop_plan']
+            for a,b in zip(chain,chain[1:]):
+                graph.add_edge(a,b)
+            graph.add_conditional_edges('loop_plan',lambda state:'loop_execute' if state['loop_ready'] else 'report')
+            graph.add_edge('loop_execute','loop_evaluate'); graph.add_edge('loop_evaluate','loop_plan')
+            graph.add_edge('report','explain'); graph.add_edge('explain','completion_gate')
+            graph.add_conditional_edges('completion_gate',lambda state:'loop_plan' if state['loop_reenter'] else 'finalize')
+            graph.add_edge('finalize',END)
+        else:
+            graph=StateGraph(DiagnosticState)
+            for name,fn in [('plan',initial_plan),('agent_loop',agent_loop),('explain',frozen_explain),('report',final_report)]:
+                graph.add_node(name,timed_node(name,fn))
+            for a,b in zip([START,'plan','agent_loop','explain','report'],['plan','agent_loop','explain','report',END]):
+                graph.add_edge(a,b)
         connection = sqlite3.connect(self.store.db_path,check_same_thread=False)
         try:
             compiled = graph.compile(checkpointer=SqliteSaver(connection))
-            with model_budget(remaining()):
+            with model_budget(total_remaining()):
                 final = compiled.invoke({"question":question,"action_id":action_id,"scope":json.loads(dumps(scope.__dict__)),
                                      "artifact_refs":[],"refs":[],"notices":[],"steps":[]},
                                     {"configurable":{"thread_id":sid+':'+action_id},"recursion_limit":96})
@@ -683,6 +843,12 @@ class DiagnosticEngine:
                   "responsibility_evidence":ephemeral["responsibility_evidence"],"requirements":final["requirements"],"backfill_rounds":final["backfill_rounds"],"validation_errors":ephemeral["validation_errors"],"plan":final["plan"],"steps":final["steps"],"references":final["refs"],"retrieval_mode":final["retrieval_mode"],
                   "case_assessments":ephemeral["case_assessments"],"peers":ephemeral["peers"],"summary":ephemeral["summary"],"artifacts":ephemeral["artifacts"],"feature":ephemeral["feature"],
                   "hypotheses":ephemeral["hypotheses"],"claims":ephemeral.get("claims",[]),"visual":ephemeral["visual"]}
+        if not legacy_graph:
+            result.update(graph_version=GRAPH_VERSION,evidence_bundle=final['evidence_bundle'],
+                          output_status='PARTIAL' if ephemeral['model_status'].get('explain','').startswith(('FAILED','VALIDATION_FAILED','NOT_RUN_UNFINISHED')) else 'READY',
+                          analysis_steps=final.get('analysis_steps',[]),tool_ledger=ephemeral.get('tool_ledger',[]),
+                          explanation_ref=ephemeral.get('explanation_ref'),report_ref=ephemeral.get('report_ref'),
+                          report_index=ephemeral.get('report_index',{}),analysis_plan=final.get('analysis_plan',{}))
         for artifact in result["artifacts"]:
             if confirmed_request: artifact["confirmed_request_hash"]=confirmed_request["request_hash"]
         self.store.finish(sid,action_id,result)

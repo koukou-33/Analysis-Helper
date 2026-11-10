@@ -485,6 +485,18 @@ with right:
                     st.caption(f"整次分析预算 {budget_info['total_seconds']} 秒；进入验证循环时剩余 {budget_info.get('loop_entry_remaining_seconds')} 秒；结束时剩余 {budget_info['remaining_seconds']} 秒。")
                     st.dataframe(pd.DataFrame([{'阶段':name,'状态':budget_info.get('stage_status',{}).get(name,'历史记录'),'累计耗时（秒）':elapsed} for name,elapsed in budget_info.get('stage_seconds',{}).items()]),hide_index=True)
                 st.json(result.get('verification_loop',{}))
+                st.json(result.get('tool_ledger',[]))
+            if result.get('report_index'):
+                with st.expander('完整分析报告与证据关联'):
+                    st.caption('报告与解释引用同一冻结证据包；以下索引可回查分析步骤和完整数据。')
+                    st.json(result.get('evidence_bundle',{}))
+                    st.json(result['report_index'])
+                    st.download_button('下载分析报告与关联索引',
+                        json.dumps({'answer':result['answer'],'evidence_bundle':result['evidence_bundle'],
+                                    'report_index':result['report_index'],'report_ref':result.get('report_ref')},
+                                   ensure_ascii=False,indent=2),
+                        file_name='analysis_report.json',mime='application/json',
+                        key='report_download_'+result['action_id'])
             advanced=st.checkbox('显示技术详情与高级查询',value=False,key='advanced_'+sid)
             if advanced:
                 st.json(result["plan"])

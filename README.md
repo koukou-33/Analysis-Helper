@@ -23,7 +23,7 @@ python -m venv .venv
 
 ## 诊断流程
 
-LangGraph 执行检索 → 计划 → 受控查询 → 证据验证 → 回答。模型未配置时仍提供确定性统计；embedding 未配置时使用 BM25。特性分析要求明确出处、条件与生效规则；未知与失败分别呈现。模型假设不会自动变成已确认根因。
+新动作由 LangGraph 执行 plan → agent_loop → explain → report：循环内检索、受控查询及验证，冻结证据包后单向生成解释与关联报告；旧动作保持兼容恢复。模型未配置时仍提供确定性统计；embedding 未配置时使用 BM25。特性分析要求明确出处、条件与生效规则；未知与失败分别呈现。模型假设不会自动变成已确认根因。
 
 工作台支持历史会话、范围筛选、图表、完整 Parquet 下载、结构化计划编辑及受控探索 SQL。用户审核案例后发布 Markdown/图片版本包，检索索引可重建。真实模型接入说明见启动手册。
 
@@ -38,3 +38,5 @@ LangGraph 执行检索 → 计划 → 受控查询 → 证据验证 → 回答�
 相对路径从仓库根目录解析。详见 [样例验证](docs/SAMPLE_VALIDATION.md) 与 [字段说明](knowledge_assets/field_mappings/nr_srs_field_mapping.md)。新清洗版本 m1.3 增加可查询补充标量字段；m1.2 历史数据仍可恢复，旧数据集不会自动迁移。
 
 后续开发可使用 `generate` 命令生成正常或混合异常数据，正常四流增益严格递减。生成与范围统计使用方式见 [随机测试数据](docs/SYNTHETIC_DATA.md)。
+
+专家循环实现、验证及能力边界见 [v3.4 实施方案](docs/EXPERT_LOOP_IMPLEMENTATION_PLAN.md)。
