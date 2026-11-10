@@ -1,0 +1,1318 @@
+# 设计文档整理前快照（2026-11-10）
+
+此文件保存按主题整理前的完整文档，包含历史方案、讨论结论和交付记录，仅用于追溯，不作为当前设计规范。当前设计见 [主设计文档](../../5g_srs_diagnostic_agent_design_spec.md)，变更索引见 [设计变更记录](../DESIGN_CHANGELOG.md)。下文中的章节号与相对路径均保留快照时语境；旧规则不能覆盖主文档。
+
+---
+
+# 5G NR SRS 基带问题定位专家 Agent 软件详细设计说明书（SDS 图文案例整合版）
+
+修订日期：2026-11-10（v3.4 目标设计：统一专家分析 Agent Loop 与单向解释/报告流程）。保留 v3.3 基线、图文案例和截至 §29 的现场修订；§5、§19 与新增 §30 按本次确认更新。新架构尚待实现，§19.8 保留现有记录条件循环的实现边界，不代表 v3.4 已交付。
+
+本次架构以 §30 为准：`START → plan → agent loop → explain → report → END`。全部取证、候选原因验证及必要补查在 loop 内完成；退出时冻结分析证据包，explain 基于包内结果形成解释与结论，report 关联各步分析、数据及结论，二者均不返回 loop。历史章节中与本次编排冲突的要求已注明替代关系；既有数据清洗、质量、统计口径、案例审核及默认直接执行规则继续有效。
+
+整合原则：案例源文件采用 Markdown + images；数据仍按 CRNTI 缺失判定流控、完整块全留，时间使用 uwData + uwTime，身份使用 logicCellId。相似案例不以全部判据通过为展示门槛；不沿用旧版自动定案、固定耗时承诺或重复引入的旧 SQL。
+
+## 1. 目标、范围与业务约定
+
+系统读取 CDT `NR_SRS.*.csv` 宽表，完成确定性清洗、指标统计、相似案例辅助解释、特性文档驱动诊断与交互下钻，以及经人工审核的案例固化。专家分析采用统一 Agent Loop，LLM 负责问题理解、动态选择分析工具、提出与综合假设、解释及草稿提炼；数据计算、查询合法性、证据校验、版本与预算管理由程序执行。分析依据中间结果调整，不能仅凭节点执行成功或模型自述判定问题闭环。
+
+### 1.1 已确认的业务边界
+
+1. **流控只在单文件内处理**，不合并不同文件的块。各文件清洗结束后，可以共同参与会话构建、统计和查询。
+2. 同文件中，按原始记录顺序划分连续相同 `uwTtiCnt1` 的块；不得先按计数值排序，不得合并不连续的同值块。
+3. **流控仅判断原始 CRNTI 是否缺失。块内所有行 CRNTI 非空即为完整块，全部保留，包括单行块；存在 CRNTI 缺失行才执行截断。** TLV 打点的身份字段位于前几个 value，不额外通过尾部字段、日期格式或测量完整性判断流控。
+4. `uwData` 表示日期（字段名保持原样），与 `uwTime` 共同确定日期时间；一般最多两天，不通过文件顺序或午夜跳变猜日期。
+5. 除非用户特别说明，输入来自同一站点。小区身份使用 `logicCellId`，用户分析会话使用 `logicCellId + crnti + 会话开始时间`。`phyCellInst` 保留为辅助分析字段。
+6. 可疑记录和非法流数记录整行退出全部业务统计，原始记录及质量审计保留。RSRP/NI 越界原因独立记录，缺测不等于可疑。所有业务入口执行统一准入，详见 §3.4。
+7. `max_stream_gain_diff` 默认表示同一分析范围内各流均值的最大值减最小值。
+8. RSRP、NI 默认以 dBm 输入，默认对 dBm 数值直接求算术均值；结果标明该口径。增益仍按字段定义使用 dB，差值单位为 dB。
+9. 不考虑 RB 区间重叠。默认 30 kHz；实际流数以每行 ueLayerNum 为准（1/2/4，未来 8）；版本差异、非默认配置、多站点等特殊条件由用户在问题描述中说明，本期不实现混合版本自动拆分或多站点自动推断。
+10. 相似案例可直接提出，并说明相似点、差异、尚未验证项及可借鉴的推理过程；无需先满足全部定量判据。相似不等于根因确认。
+11. 不同数据集独立加载和分析，禁止自动合并统计；同一数据集可包含用户明确归为同一次分析的多个文件。每次查询绑定唯一 dataset_id。
+
+### 1.2 首轮问题上下文
+
+界面提供问题描述及可选补充信息：软件版本、采集场景、非默认子载波间隔或流数、是否包含多个站点、已知现象与外部验证结果。默认条件无需反复确认。
+
+只对实际影响当前分析的缺失信息追问；已明确超出支持范围的配置应告知限制并停止受影响分析，不静默套用默认规则。基础字段映射仍支持按用户描述选取既有版本映射，不建设混合版本解析系统。
+
+### 1.3 技术栈
+
+| 组件 | 职责 |
+| --- | --- |
+| Streamlit、Pandas、Plotly、Pillow | 三栏工作台、图表、图片读取与图文审核；图片尺寸与格式校验 |
+| DuckDB 持久化数据库、PyArrow/Parquet | 数据集单文件数据库、ETL 中间产物与完整查询结果落盘 |
+| LangGraph、LangChain Core、langgraph-checkpoint-sqlite | 多轮状态、SqliteSaver 持久化、诊断路由与审核流程 |
+| Markdown + YAML Frontmatter + images/ | 人工维护的案例权威源文件，解析库可选 python-frontmatter |
+| SQLite | 会话注册、检查点、证据元数据、审核记录与案例解析缓存/同步状态 |
+| Qdrant、rank_bm25 | 可从权威存储重建的语义与关键词索引 |
+| Pydantic v2 | 输入、输出与业务契约校验 |
+
+实现时锁定一组经联调验证的依赖版本，提交锁文件；不以宽松的最低版本声明代替兼容性测试。性能指标通过真实数据基准给出，不预先承诺全量 ETL 毫秒级完成。
+
+## 2. 工程结构与知识资产布局
+
+~~~text
+5g_srs_expert_agent/
+├── app.py
+├── .env.example
+├── config/
+│   ├── settings.py
+│   ├── input_contract.yaml
+│   └── query_templates/
+├── knowledge_assets/                        # 可人工编辑、可纳入 Git 的知识源文件
+│   ├── field_mappings/nr_srs_field_mapping.md
+│   ├── features/                            # 特性 B 等文档及出处
+│   ├── scenarios/scenario_metrics.yaml
+│   └── cases/
+│       └── CASE_SRS_001/
+│           ├── CASE_SRS_001.md
+│           └── images/
+│               ├── reference_heatmap.png
+│               └── reference_curve.png
+├── data_pipeline/
+│   ├── csv_loader.py
+│   ├── schema_aligner.py
+│   ├── etl_engine.py
+│   └── anomaly_profiler.py
+├── knowledge_base/
+│   ├── models.py
+│   ├── case_markdown_parser.py
+│   ├── kb_sync_manager.py
+│   ├── schema_kb.py
+│   ├── case_kb.py
+│   ├── scenario_kb.py
+│   └── feature_kb.py
+├── agent/
+│   ├── state.py
+│   ├── prompts.py
+│   ├── sql_executor.py
+│   ├── assertion_evaluator.py               # 可选定量验证
+│   ├── query_planner.py
+│   ├── query_compiler.py
+│   ├── evidence_validator.py
+│   ├── nodes.py
+│   └── graph.py
+├── ui/
+│   ├── state_manager.py
+│   ├── sidebar_panel.py
+│   ├── chat_panel.py
+│   ├── canvas_panel.py
+│   └── chart_renderer.py
+├── tests/
+│   ├── fixtures/
+│   ├── test_pipeline.py
+│   ├── test_assertions.py
+│   ├── test_case_assets.py
+│   ├── test_session_restore.py
+│   └── test_diagnostic_flow.py
+└── workspace_storage/                       # 不作为知识源文件提交
+    ├── session_registry.sqlite              # 注册信息及独立命名的检查点表
+    ├── knowledge_registry.sqlite            # 审核/同步记录、解析缓存
+    ├── qdrant_local_db/
+    ├── datasets/{dataset_fingerprint}/
+    │   ├── analysis.duckdb
+    │   ├── input_manifest.json
+    │   └── snapshot/
+    └── sessions/{session_id}/
+        ├── artifacts/                      # 完整表结果与图表
+        └── drafts/                         # 审核前的图文草稿包
+~~~
+
+目录中的案例和图片名称仅为布局示例，不表示已有真实案例资产。字段映射与场景配置统一移到 knowledge_assets，避免与 config 内的旧副本产生双源。图表静态导出适配器与锁定版本联调；导出不可用时保留表格及交互图，不阻断其他诊断。
+
+## 3. 数据底座 L1～L4
+
+### 3.1 L1：单文件保序加载与输入契约
+
+递归扫描生产文件名 `NR_SRS_XX-XX_XX-XX-XX.csv` 和 `NR_SRS(1)_XX-XX_XX-XX-XX.csv`（括号内允许任意非负整数）。使用大小写不敏感的全名匹配 `^NR_SRS(?:\(\d+\))?_\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.csv$`，兼容旧测试文件 `NR_SRS.*.csv`。目录扫描不接受 `NR_SRS_temp.csv`、备份扩展名或其他前缀；显式指定单个 CSV 路径仍允许任意名称。文件名时间不替代 CSV 内时间。`SYS_INFO.*.csv` 可作为版本说明的辅助信息；与用户说明冲突时显式呈现冲突，不自行选择。
+
+CSV 读取器逐文件、按原始记录顺序解析，并在任何排序、过滤或并行计算之前固化：
+
+| 字段 | 定义 |
+| --- | --- |
+| `source_file` | 数据集内规范化相对路径，保持唯一 |
+| `source_file_hash` | 文件内容哈希 |
+| `file_row_id` | 文件内从 1 开始的数据记录序号，不含表头 |
+| `record_id` | 数据集 ID、来源文件与记录序号构成的唯一标识 |
+| `csv_structure_complete` | 原始记录列数及解析结构是否符合表头 |
+| `crnti_present` | 仅判断原始 CRNTI 经空白/空值编码规范化后是否非空，与数值转换成功与否无关 |
+
+使用支持 CSV 引号与嵌入换行的解析器，`file_row_id` 是逻辑记录序号；如需定位文本物理行，可另存起止行号。不得用无排序的 `ROW_NUMBER() OVER (PARTITION BY filename)` 替代原始记录编号。
+
+分批写入 Parquet 或 DuckDB，避免全量宽表转为 Python 对象常驻内存。少列的可解析记录保留其原始结构缺陷；引号损坏等无法可靠确定记录边界的文件进入加载错误报告，禁止静默跳过。
+
+#### 3.1.1 流控判定与其他数据异常分离
+
+`input_contract.yaml` 显式声明：
+
+- `date_format`、`time_format`、编码、分隔符、空值编码；
+
+2026-10-25 现场修订：CSV 日期采用年-月-日，如 `2026-10-25`。Python 解析格式为 `%Y-%m-%d`（`%M` 是分钟，`%D` 不是此处所需的日格式）。标准契约和样例映射契约均使用该日期格式，时间格式仍分别为 `%H:%M:%S.%f` 和 `%H:%M:%S`。非法日期保留原始记录并标记 `INVALID_DATE`，不得静默推测格式。旧数据集保存原契约不变；修复历史日期解析需要使用新契约重新加载源 CSV。
+
+补充字段查询性能约束（现场问题 AH-002）：
+
+- 规划阶段只读取已保存的表头元数据和零行关系模式，不查询补充数值明细，不构建范围表或宽表。
+- 执行阶段从 QueryPlan 的条件、分组、指标、比较字段、关联键及显式 `required_fields` 提取所需列。特性生效标志必须纳入 `required_fields`，确保完整证据和回放一致。
+- 先构建范围内 resource，再以 record_id 半连接过滤补充数值表，并限定字段名，最后聚合并左连接；缺失/非法值仍为 NULL。默认四流统计不读取补充数值明细。
+- 手工 SQL 从已校验的 AST 提取字段；`COUNT(*)` 不触发全字段展开，显式 `SELECT *` 仍表示全列输出，大范围全列查询应缩小范围或改为指定列。
+- 保留 512 MB、2 线程及 30 秒连接操作预算，不以延长超时替代优化。已有 m1.3 数据集可直接使用新的查询路径，无需为性能修复重建数据。
+- 440 字段、34,000,120 行合成补充数据的基准与复现方法见 `docs/ISSUES.md`。该基准验证准备阶段，不代表现场全链路延迟。
+- 查询计划在执行前校验操作语义：CONDITION_COUNT 必须提供 conditions 字典（c0..c999，1–20 项），禁止以 condition 或 metrics 代替；同时校验其他操作必填参数、聚合输出冲突及时间范围。校验错误以位置和规则反馈模型，最多修复两次，失败使用描述性基础计划。
+- AH-006：规划阶段依据真实字段目录，逐步推导各关系输出列。聚合仅保留分组列、sample_cnt 和指标输出；条件计数的汇总表和 `_rows` 明细分别建模。比较、分组、聚合、时间关联必须引用当前 source 的列，不能以 depends_on 代替 source 切换。错误反馈 FIELD_SOURCE_MISMATCH、位置和可用关系；执行入口再次校验。真正不存在的特性条件字段仍按 UNKNOWN 处理。
+- 2026-10-26 用户确认：instBfSinrGain[0..3] 确定对应第一至第四流（STREAM），不适用其他短数组的 UNCONFIRMED_ARRAY 分类。通常按流序递减，倒序仅待核查，不能直接判定故障。增益全空仅报告缺测，不推断采集故障，不重复确认映射。更新知识版本，规划与解释系统规则采用同一口径；无有效增益样本时仅标记增益证据不足，不阻断 NI 等其他问题；解释及视觉比对由当前问题的必要证据决定。
+- 解释校验拒绝需记录错误码、数组位置、尝试次数，并持久化到动作结果 validation_errors 及本地性能文本日志；向模型反馈具体位置、允许的数值列/单位及空列表降级方式。最终提示展示拒绝原因，仍禁止将未验证解释发布为事实。日志不保存原始模型响应，因此不保证能还原修复前的历史解释错误；参见 AH-005 / GitHub #1。
+- 性能观测：加载、基础统计、范围准备、查询、模型调用和完整诊断的耗时及进程驻留内存写入独立 UTF-8 文本 `workspace_storage/logs/performance.txt`（每行 JSON）。阶段以 trace_id 关联，记录成功或异常类型；不写密钥、提示词、SQL 或原始业务记录。每 100 ms 采样的最大值为整个进程的采样峰值，不等同于单查询独占峰值。导入时累计补充行数，不新增全表扫描。日志故障不影响业务结果。字段和归档方式见 `docs/PERFORMANCE_LOG.md`。
+- `required_identity_columns`：`uwTtiCnt1, logicCellId, crnti, uwData, uwTime`；
+- `flow_presence_column`：固定为 `crnti`，只检查原始值是否缺失；
+- `nullable_measurement_columns`：允许合法缺测的测量列；
+- `stream_metric_families`：已确认按流解释的数组列族。
+
+`crnti_present = 原始 crnti 经显式空值规范化后非空`。即使非空 CRNTI 无法转成数字，也保留该存在性标记，另报类型解析错误；不能因转换结果为 NULL 而触发流控。数值 0 不自动视为空值，除非输入空值编码明确如此规定。
+
+完整块的唯一条件为所有行 `crnti_present=true`。CSV 列数、日期或身份格式错误、尾部测量缺失、越界值均不能触发流控截断。CRNTI 整列不存在属于文件契约缺失，报告文件失败；列存在但记录值全空，则按全空块处理。其他必需字段错误只影响其相关分析；无法建立块键或解析 CSV 记录边界时，记录输入错误而非虚构流控结论。
+
+#### 3.1.2 固定输入、文件去重与部分加载
+
+建立本次 `input_manifest`，将文件复制到会话输入快照，校验复制前后源文件与快照内容哈希一致；读取期间变化的文件重试，仍不稳定则列入失败清单。后续 ETL 只读已固定快照，源目录新增或修改不影响本次结果，重新加载产生新数据版本。
+
+对快照按内容哈希与长度识别相同文件，确认字节内容相同后仅处理一份，记录所有重复来源路径及代表文件；去重先于 ETL 和样本计数。内容不同的文件不按时间戳擅自去重。
+
+文件采用独立事务或临时输出：解析失败的文件不提交其半成品；其他成功文件继续分析。清单记录 `LOADED / DUPLICATE / FAILED`、源路径、快照哈希、重复指向、错误原因和可定位的行号。部分成功标记 `PARTIAL_READY`，报告说明基于哪些成功文件、多少记录及日期范围，以及失败文件和原因。全部失败标记 `FAILED`。无法归属时间的错误不猜测覆盖范围。
+
+字段异常保留原始值及独立原因，如 `MISSING_VALUE / PARSE_ERROR / NON_FINITE / INVALID_DATE / CSV_STRUCTURE_ERROR / INVALID_BLOCK_KEY`；只有真实缺测计入缺测数，解析失败和非有限值另行计数，不能因统一投影为 NULL 而丢失原因。
+
+### 3.2 L2：列标准化与时间坐标
+
+1. 按已选择的字段映射对齐列名，类型转换使用显式规则；失败值记录解析异常，不静默改成正常值。
+2. 在 L1 完整扫描/统计后可提前投影移除确认全空的可选列，使后续窗口计算与物化少携带空列；保留字段可用性元数据，区分“不存在”“全空”“部分缺测”“可用”。不能以少量采样推断全空，必选身份、CRNTI 存在性及来源键不裁剪。保序记录号必须先固化，缺失列按需要补类型化 NULL；前置投影主要降低后续内存与存储开销，不承诺免去 CSV 初次扫描。
+3. `event_ts = parse(uwData + uwTime)`，保留原始日期时间及其真实精度；`time_sec` 为相对数据集最早有效时间的秒差。缺日期或时间无法解析时记录时间错误，不推测跨日。
+4. 默认 `slot_in_frame = subFrmNum * 2 + slot`，范围 `0..19`；`freqRbEnd = freqRbStart + freqRbNum - 1`，要求长度为正。超出默认配置按用户说明处理或报告不支持。
+5. `uwTtiCnt1` 缺失的记录不能加入邻近块，单独标记 `INVALID_BLOCK_KEY` 并隔离；计入加载/结构问题，不计作已确认流控截断。
+
+L2 暂不生成最终 `ue_uid`；必须先完成文件内流控过滤，以免被截断的记录参与会话边界判断。
+
+### 3.3 L3：完整块保留与不完整块截断
+
+#### 3.3.1 流控规则
+
+每个文件独立按 `file_row_id` 处理。`uwTtiCnt1` 相对前一记录变化时建立新块，块键为 `(source_file, block_seq)`，另保留原始计数值。缺失块键的隔离记录也打断相邻块。
+
+1. 块内 `crnti_present` 全为真：全块 `VALID_FLOW`，包括单行块，不删除最后一行。
+2. 块内至少一行 CRNTI 缺失：找到最后一个 `crnti_present=true` 的行，其从 0 开始的块内序号为 `last_good_idx`。该名称仅表示截断边界，不保证此行尾部测量完整。
+3. 对上述块，只保留 `idx_in_block < last_good_idx AND crnti_present` 的行；边界行及其后续全部标记 `INVALID_FLOW_CTRL`。前缀中 CRNTI 缺失的行同样排除；其他字段问题不影响流控标签，另行记录其分析资格。
+4. 不完整块内 CRNTI 全空：全块排除。单行不完整块同样排除。
+5. 记录 `has_missing_crnti`、`last_good_idx`、块大小、剔除原因和每文件统计。原始行与标签保留，L4 通过过滤排除，不物理销毁源数据。
+
+不再提供 `SINGLE_ROW_BLOCK_POLICY` 或 `keep_single_valid_row` 两套例外开关；是否完整就是唯一入口条件。
+
+#### 3.3.2 行级质量与缺测
+
+仅在 `VALID_FLOW` 行上执行质量检查：
+
+- `usrRsrp` 非空且不满足 `-160 < usrRsrp < -60`，或 `srsUeNiDb` 非空且不满足 `-130 < srsUeNiDb < -80`：`is_suspicious = true`。
+- 任一上述测量字段真实缺失：`has_missing_measurement = true`；缺测本身不作为越界可疑。解析失败、非有限值使用独立原因标记，不混入缺测数。
+- `data_quality_tag` 优先级为 `INVALID_FLOW_CTRL`、`PARSE_ERROR`、`SUSPICIOUS`、`MISSING_DATA`、`VALID_NORMAL`。L2 产生独立 `has_parse_error`（包括数值、日期等解析失败与非有限数字），完整原因另存；布尔可疑/缺测标记不因显示优先级改变。另行隔离的块键错误不进入以下 SQL。
+- 同一行可同时可疑和缺测：分别计入 `suspicious_cnt`、`missing_cnt`，界面说明两者可能重叠，不相加作为总行数。
+- 独立记录 RSRP/NI 可疑子类别，可在质量明细查看原始数值。其他字段的缺测保留字段级计数供当前查询判断。完整异常原因保存在 `error_reasons`；解析失败必须在 UI 明确显示，不得呈现为正常。可疑记录或非法流数整行排除；其余记录再按字段级解析状态决定指标是否可计算。
+
+以下 SQL 输入为具有已固化 `file_row_id`、非空 `uwTtiCnt1`、非空布尔 `crnti_present` 的 `l2_standardized`。隔离的块键错误不删除其记录序号，序号间隙用于打断块。可选测量列缺失时通过规范投影补充带类型 NULL，并同步记录不可用状态。L2 同时产生非空布尔 `has_parse_error`；另行产生的 `rsrp_missing / ni_missing` 布尔标记仅指真实缺测或列缺失。解析错误与非有限值另记原因并投影为类型化 NULL。
+
+```sql
+CREATE OR REPLACE TABLE l3_cleaned_srs AS
+WITH prev_row AS (
+    SELECT *,
+        LAG(uwTtiCnt1) OVER w AS prev_tti,
+        LAG(file_row_id) OVER w AS prev_row_id
+    FROM l2_standardized
+    WINDOW w AS (PARTITION BY source_file ORDER BY file_row_id)
+),
+block_mark AS (
+    SELECT *,
+        CASE WHEN prev_row_id IS NULL
+               OR file_row_id <> prev_row_id + 1
+               OR uwTtiCnt1 IS DISTINCT FROM prev_tti
+             THEN 1 ELSE 0 END AS new_block
+    FROM prev_row
+),
+block_id AS (
+    SELECT *,
+        SUM(new_block) OVER (
+            PARTITION BY source_file ORDER BY file_row_id
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS block_seq
+    FROM block_mark
+),
+numbered AS (
+    SELECT *,
+        ROW_NUMBER() OVER (
+            PARTITION BY source_file, block_seq ORDER BY file_row_id
+        ) - 1 AS idx_in_block
+    FROM block_id
+),
+block_stats AS (
+    SELECT *,
+        COUNT(*) OVER w AS block_size,
+        BOOL_OR(NOT crnti_present) OVER w AS has_missing_crnti,
+        MAX(CASE WHEN crnti_present THEN idx_in_block END)
+            OVER w AS last_good_idx
+    FROM numbered
+    WINDOW w AS (PARTITION BY source_file, block_seq)
+),
+flow_tagged AS (
+    SELECT *,
+        CASE WHEN NOT has_missing_crnti THEN 'VALID_FLOW'
+             WHEN idx_in_block < last_good_idx AND crnti_present
+                  THEN 'VALID_FLOW'
+             ELSE 'INVALID_FLOW_CTRL' END AS flow_status
+    FROM block_stats
+),
+quality_flags AS (
+    SELECT *,
+        flow_status = 'VALID_FLOW' AND (
+            COALESCE(usrRsrp <= -160 OR usrRsrp >= -60, false)
+            OR COALESCE(srsUeNiDb <= -130 OR srsUeNiDb >= -80, false)
+        ) AS is_suspicious,
+        flow_status = 'VALID_FLOW' AND
+            (rsrp_missing OR ni_missing) AS has_missing_measurement
+    FROM flow_tagged
+)
+SELECT *,
+    flow_status = 'VALID_FLOW' AND COALESCE(ueLayerNum IN (1,2,4,8), false)
+        AND NOT is_suspicious AS business_eligible,
+    CASE WHEN flow_status <> 'VALID_FLOW' THEN 'INVALID_FLOW_CTRL'
+         WHEN ueLayerNum IS NULL OR ueLayerNum NOT IN (1,2,4,8) THEN 'INVALID_LAYER_COUNT'
+         WHEN has_parse_error THEN 'PARSE_ERROR'
+         WHEN is_suspicious THEN 'SUSPICIOUS'
+         WHEN has_missing_measurement THEN 'MISSING_DATA'
+         ELSE 'VALID_NORMAL' END AS data_quality_tag
+FROM quality_flags;
+```
+
+该 SQL 将窗口函数拆为独立阶段，禁止窗口函数嵌套。源值的非有限数字与解析错误应在 L2 标记并归入相应异常，不能作为正常测量输入。
+
+#### 3.3.3 观测会话与唯一性
+
+在流控清洗完成后，对有效且身份、时间可用的记录按 `(logicCellId, crnti)` 分组，以 `(event_ts, frmNum, slot_in_frame, source_file, file_row_id)` 稳定排序。相邻观测间隔 `>180` 秒时建立新观测会话，等于 180 秒不切分。
+
+`ue_uid = "{logicCellId}_{crnti}_{session_start_ts}"`，时间采用完整日期与源精度的规范格式。同一身份同一时间的记录属于同一观测会话；行唯一性由 `record_id` 保证，不能将时间戳当作明细主键。数据集内对会话标识施加唯一性检查。
+
+流控有效但身份或时间不可用的记录仍保留在 L3 和质量明细中，ue_uid 允许为空，并记录 session_unassigned_reason。不得把空 ue_uid 合并为一个虚假 UE；UE 汇总排除无法归属会话的记录，时间过滤查询排除无法定位时间的记录并说明数量。其他分析仅检查其实际所需字段。基线分别列出流控有效数、会话可归属数和各指标实际统计数。
+
+这是观测会话划分，不是物理 UE 身份确认；短时间内真实 CRNTI 复用不能单凭该规则识别。除非用户提供额外身份日志，不声称确认了新 UE。
+
+多文件清洗后按上述时间共同构建会话，但绝不改变已经完成的单文件流控结果。默认单站点；用户声明多站点时，应要求分开分析或提供明确站点标识，禁止静默混合。
+
+### 3.4 L4：四张分析表及统计口径
+
+| 表 | 粒度 / 键 | 必须保留的内容 |
+| --- | --- | --- |
+| `l4_ue_resource_ts` | 每原始记录一行，`record_id` 唯一 | `logicCellId, phyCellInst, ue_uid, crnti, resourceId, uwData, uwTime, event_ts, time_sec, frmNum, subFrmNum, slot, slot_in_frame, freqRbStart, freqRbNum, freqRbEnd`、标量测量、质量标记、来源文件与记录号 |
+| `l4_ue_stream_ts` | `(record_id, streamId)` 唯一 | 上述定位与质量字段，以及对应流的指标 |
+| `l4_ue_summary` | `(logicCellId, ue_uid, resourceId)` | 起止时间、样本数、可疑数、缺测数、各指标有效样本数、RSRP/NI 统计、各流均值、`max_stream_gain_diff` |
+| `l4_cell_tf_summary` | `(logicCellId, slot_in_frame, freqRbStart, freqRbNum)` | 样本数、观测会话数、可疑/缺测数及比例、各指标有效样本数、NI 均值/分位数/最大值、RSRP 均值 |
+
+L3 审计明细保留可疑与缺测行；L4 业务明细只收入 VALID_FLOW 且流数合法、非可疑的记录。sample_cnt 指业务准入记录数；流控有效数与质量计数另列，不等同于某指标有效样本数。
+
+测量聚合统一使用 EXCLUDE_ABNORMAL_RECORD：流控有效、ueLayerNum 属于 1/2/4/8 且非可疑的记录才能参与；任一可疑指标使整行退出，包括该行其他正常指标。准入后当前指标仍需为可解析有限数值；缺测不补零。质量计数基于原始流控有效行，单独披露分母。
+
+当前分析范围由唯一数据集及用户选择的小区、UE、资源、时间条件确定。每组输出 sample_cnt、metric_valid_cnt、suspicious_cnt、suspicious_ratio、missing_cnt、missing_ratio、parse_error_cnt，以及实际起止时间。可疑比例与行级缺测比例以该组流控有效原始记录数为分母，两种计数可能重叠；指标级缺测率另列且命名明确。空分母返回 NULL。“异常比”在常规统计中指 suspicious_ratio，不等同于特性未生效率。
+
+以下全范围示例运行时必须先套用用户过滤条件；进入 L4 的非法或非有限测量值已转换为类型化 NULL 并保留原始值/原因：
+~~~sql
+SELECT
+    logicCellId, ue_uid, resourceId,
+    COUNT(*) AS sample_cnt,
+    COUNT(*) FILTER (WHERE is_suspicious) AS suspicious_cnt,
+    AVG(CASE WHEN is_suspicious THEN 1.0 ELSE 0.0 END) AS suspicious_ratio,
+    COUNT(*) FILTER (WHERE has_missing_measurement) AS missing_cnt,
+    AVG(CASE WHEN has_missing_measurement THEN 1.0 ELSE 0.0 END) AS missing_ratio,
+    COUNT(*) FILTER (WHERE has_parse_error) AS parse_error_cnt,
+    COUNT(usrRsrp) AS rsrp_valid_cnt,
+    AVG(usrRsrp) AS rsrp_avg,
+    COUNT(srsUeNiDb) AS ni_valid_cnt,
+    AVG(srsUeNiDb) AS ni_avg,
+    QUANTILE_CONT(srsUeNiDb, 0.9) AS ni_p90,
+    MIN(event_ts) AS start_time,
+    MAX(event_ts) AS end_time
+FROM l4_ue_resource_ts
+WHERE ue_uid IS NOT NULL
+GROUP BY logicCellId, ue_uid, resourceId;
+~~~
+
+流展开按已确认字段族同步构造四元素列表并 UNNEST；缺失下标补带类型 NULL，不能前移。标量统计从资源明细计算；流组内每条原始记录仅计一次，跨流累计时按 record_id 去重，不能使四倍展开改变异常比例。
+
+同一数据集内比较 UE、资源或流时，各组独立计算均值及上述比例，**不强制取共同记录交集，不因时间覆盖不同丢弃样本**。同一 UE/资源/用户时间窗内，max_stream_gain_diff = max(各流均值) - min(各流均值)，至少两流有值才返回差值；报告列明哪些流有数据，不能把两流结果称为四流结果。资源是同一数据集中的不同 resourceId，不是版本或独立数据集。
+
+时间、RB、样本量或覆盖不同可提示解释限制，但不阻止描述性出表。只有某项特性文档明确要求逐事件或时间关联时，才为该特定条件建立关联，不能将其变成所有均值比较的全局配对规则。
+
+全周期汇总只在数据版本、过滤范围、指标和分组口径一致时复用；其他情况从明细重算，不能对均值再简单求均值，或从组分位数拼出总体分位数。缓存键包括数据指纹、过滤条件、指标定义和规则/计划版本。RB 不重叠，不实现区间拆分；默认描述为 RB 区间统计。
+
+
+### 3.5 均值、波动与时间序列补充
+
+l4_ue_summary 增加 rsrp_std、rsrp_trend_delta、ue_total_records 和指标有效计数。rsrp_std 使用样本标准差，不足两点为 NULL；rsrp_trend_delta 为当前对象有效时间覆盖中点之后的 RSRP 均值减之前的均值（dB），中点属于后半段；两侧无数据或起止时间相同时返回 NULL。不得将该指标单独解释为单调趋势。
+
+ue_total_records 在当前过滤范围按 ue_uid 对资源明细的 record_id 去重计数，不能累加流展开行数。普通时序表使用含日期的 event_ts 按秒分桶，按 UE、resourceId、streamId（流表适用）分别输出均值、异常比、缺测计数及样本数；不能仅按 HH:MM:SS 把两天同一时刻合并。展示降采样/桶宽明确标记，图表预览不改变原始统计和证据。
+
+### 3.6 本地数据集持久化与恢复
+
+L2、L3、L4 和 _etl_meta 固化至数据集目录内 analysis.duckdb。_etl_meta 至少包含完整 dataset_fingerprint、输入清单哈希、映射/清洗/schema 版本、READY/PARTIAL_READY 状态、成功/失败来源、基线及构建完成时间。
+
+数据指纹沿用已确认的内容哈希、配置和规则版本，路径/文件大小/mtime 只能作为查找提示，不能单独证明内容一致。恢复已保存会话时按其固定数据版本重新打开数据库，无需重新扫描原始 CSV；重新加载源目录则建立并核对新清单，不能把旧快照冒充最新源数据。
+
+构建中数据库不对诊断开放；成功后发布完成元数据，部分成功记录覆盖清单。数据库不存在、构建未完成、损坏或 schema 不兼容时提示修复/重建，不能仅因文件存在即复用。相同数据版本的写入串行化，查询使用受控连接；重启恢复性能通过基准测试，不作“0 秒”或固定毫秒承诺。
+
+
+## 4. 知识库、相似案例与特性文档
+
+### 4.1 字段元数据
+
+FieldMeta 包含标准名、原始名映射、中文含义、类型、单位、所在表、数组族、可空性、有效范围及场景标签。target_l4_tables 可包含四张分析表。字段可用性以当前数据实际 schema 为准，文档提到的字段不代表数据里一定存在。
+
+检索相关字段后合并该表适用的身份、时间、质量键。字段语义或单位不能可靠映射时记录待确认项，不自行猜测。无需为每种问题事先写一份 SQL。
+
+### 4.2 相似案例辅助解释
+
+CaseCard 包含 case_id、revision、title、scenario_category、symptom_description、applicability、historical_observations、reasoning_chain_template、root_cause、troubleshooting_advice、source_refs、confirmation_requirements、review_status。verification_steps 和 assertions 为可选增强字段，缺少它们不阻止展示相似案例。
+
+先基于问题、当前数据指纹和特性名称召回案例，再展示：
+- 相似点：当前实测事实与历史现象分别引用来源；
+- 差异点：实际观察到的不一致；
+- 尚未验证项：字段或外部日志缺失、条件未检查；
+- 可借鉴的排查过程：历史现象如何支持假设，需要哪些进一步证据；
+- 当前结论：事实、假设与确认信息分开表述。
+
+相似度只用于检索排序，不是根因概率。不得把案例的历史数值当成当前数据，也不能因无法验证而把案例写成已排除。多案例可并列，无须强选一个。
+
+若案例已有明确可执行判据，可计算 MATCH / NO_MATCH / INSUFFICIENT 作为附加说明，不作为案例展示或解释的前置门禁。断言针对具体对象逐组返回；空结果、缺字段为 INSUFFICIENT。查询失败记录技术错误，不描述为证伪。门限必须来自文档或用户规则，不能为了运行模板临时编造。
+
+### 4.3 检索与案例固化
+
+案例、字段、场景和特性文档分别索引；使用 Qdrant + BM25 融合召回，案例默认 Top-3 可配置。数据指纹展示实测差异与异常比例，没有门限时不强行二分“正常/异常”。
+
+案例的权威源是 knowledge_assets/cases 下的 Markdown 与图片包；SQLite 保存解析缓存、资产清单、审核记录及同步任务，Qdrant/BM25 为可重建索引，不允许数据库与 Markdown 各自维护一套正文。规则元数据保留原文出处与版本。相似案例入库不要求事先补齐数值阈值，须保留来源、适用条件及历史证据；未知根因作为探索记录/草稿保存。已附可执行查询应回放检查。JSON 仅作为导入导出格式，导入后转为统一案例包。
+
+### 4.4 特性文档知识契约
+
+FeatureSpec 承载特性说明，而不是只把文档作为散乱文本交给模型。支持用户提供文本/Markdown，其他格式经解析适配器转为可引用文本；文档保留版本、哈希、标题和段落定位。规则从文档提取后保留出处和解释，清晰条款可自动进入计划；影响结论的歧义或冲突才请求用户说明。
+
+核心字段：
+- feature_id、name、document_refs、applicability：特性、文档版本及适用范围；
+- flag：标准字段、启用值、未启用值、缺失/非法值含义；
+- conditions：condition_id、原文出处、条件表达式、所需字段、单位；
+- condition_role：NECESSARY（必要）、SUFFICIENT（充分）、BLOCKING（禁止）、CORROBORATING（佐证）；
+- activation_logic：AND/OR 组合及文档明确的优先级，不默认所有条件简单 AND；
+- observation_grain：单记录、UE、资源或事件；temporal_relation：同记录/先后时间/持续时长；
+- corroborating_metrics：佐证指标、预期关系和出处；
+- unresolved_items：文档歧义、缺字段、缺配置、未覆盖条件。
+
+仅满足必要条件不等于本应生效。只有充分条件或文档明确的完整生效规则成立，才能标记“按文档应生效”。没有说明触发概率、时间或顺序时不能补造。检索文档中的内容作为业务证据，不作为允许执行任意命令或改变系统规则的指令。
+
+### 4.5 特性 B 未生效的分析方法
+
+用户问“特性 B 未生效的主要原因”时，先找到 B 的定义及生效文档，再映射实际字段。下表为通用逻辑，不是假定 B 已有确定的业务条件：
+
+| 条件与观测 | 输出 |
+| --- | --- |
+| 已知必要条件不满足或禁止条件成立，B=0 | 当前未满足文档要求，列出具体条件 |
+| 完整生效规则成立，B=1，佐证一致 | 支持已生效 |
+| 完整生效规则成立，B=0 | 预期与观测不一致，继续检查佐证及执行路径 |
+| 仅必要条件满足，B=0 | 不能据此认定软件异常，检查其他触发条件 |
+| B 与佐证不一致 | 标记观测冲突，检查含义、时间关系或路径 |
+| 条件、B 或佐证缺失/非法 | 对相应判断标记 UNKNOWN，不能将缺失 B 当成 0 |
+
+查询覆盖：B 取值分布；各前提不满足的数量/比例；应生效但 B=0 的对象与时间；佐证指标及关键时序。各条件使用 TRUE/FALSE/UNKNOWN 三值，缺失不当作 FALSE。AND 中有 FALSE 可确定整体 FALSE，无 FALSE 但有 UNKNOWN 则 UNKNOWN；OR 中有 TRUE 为 TRUE，无 TRUE 但有 UNKNOWN 则 UNKNOWN。
+
+原始特性未启用率 B=0/(B=0+B=1) 与预期不一致率（应生效且 B=0 / 应生效且 B 可判断）分别命名；分母为零返回 NULL。非法或缺失 B 单独报告。各条件展示 evaluated_cnt、unmet_cnt、unknown_cnt，未满足比例使用 unmet_cnt/evaluated_cnt；同时展示相对当前 B=0 分析对象全集的覆盖，不隐去未知样本。
+
+多个条件可能同时不满足：默认提供各条件独立占比、共同评估范围内的重叠计数、涉及 UE 数及覆盖。不能把独立占比相加当作互斥原因分布。仅当文档明确优先级时才计算“首个阻止生效条件”；未知前置条件不得跳过后强行归因。
+
+“主要原因”默认描述最常观察到的未满足条件及证据，不把频率直接当因果。候选覆盖不同且无法公平排序时明确限制；保留“现有条件无法解释”的残余对象。报告采用“文档条件 → 当前数据 → 佐证/反证 → 可能解释 → 下一步检查”的可核对推理过程，可并列引用相似案例。
+
+
+### 4.6 图文 Markdown 案例包与解析契约
+
+一个案例一个目录：knowledge_assets/cases/{case_id}/{case_id}.md，图片使用包内 images/ 相对路径。支持手写文件和工作台固化，均经同一解析校验。字段名统一用 applicability、symptom_description 等契约名称；导入旧 applicable_condition 时映射为 applicability 并提示，不重复维护。
+
+案例包含 YAML Frontmatter + Markdown 分节。以下为**格式示例**，未给出实际根因或固定 Slot/RB 范围，不能作为现成诊断规则：
+
+~~~~markdown
+---
+case_id: CASE_SRS_001
+revision: 1
+title: SRS 底噪时频分布异常案例
+scenario_category: 时频干扰
+applicability: 待补充该案例的采集与配置条件
+tags: [SRS, 底噪, 时频分布]
+review_status: DRAFT
+root_cause_status: UNCONFIRMED
+symptom_description: 待填写历史观测现象
+images:
+  - image_id: reference_heatmap
+    path: images/reference_heatmap.png
+    role: HISTORICAL_MEASUREMENT
+    caption: 待填写实际可见的条带、位置与变化特征
+    caption_source: HUMAN
+    source_ref: null
+    evidence_artifact_id: null
+---
+
+# 案例说明
+
+## 1. 故障表象与适用场景
+填写实测现象、观测时间、小区配置及数据来源。
+
+## 2. 典型图表与视觉特征
+![历史底噪热力图](images/reference_heatmap.png)
+
+说明坐标轴、单位、色阶、图上可见的分布特征；
+原理示意图与历史实测图分开标注，不将示意图作为实测证据。
+
+## 3. 排查过程与可选查询
+说明每一步的问题、表格结果与推断。查询及定量判据可以不填。
+
+## 4. 推理依据、根因状态及未验证项
+区分历史已确认信息、推测和还需补充的证据。
+
+## 5. 排查建议
+填写可复用检查动作及适用限制。
+~~~~
+
+图片并非必填；无图案例可省略 images。有声明但图片缺失时明确显示缺失，不能生成虚假图片说明。多模态功能支持热力图、时序曲线、散点图及现场截图；不得硬编码某些 Slot 一定为 S 时隙，或所有数据都覆盖某固定 RB 数量，必须依据当前配置与数据。
+
+case_markdown_parser.py 使用 Markdown 结构解析：保留 YAML、正文段落、可选 SQL 块、图像引用及相邻视觉说明的关联。CaseCard 为解析投影，增加 bundle_path、source_hash、images、section_refs。ImageAsset 包含 image_id、relative_path、sha256、mime_type、width、height、role、caption、caption_source、source_ref、evidence_artifact_id。caption_source 区分 HUMAN / MODEL，自动生成说明不冒充人工确认。
+
+可执行 SQL 与叙述占位符分离：文字可保留泛化占位符，SQL 必须使用绑定参数并读取受控关系。不得照搬在汇总表上查询原始 srsUeNiDb 等不存在列的示例；可选 Slot 查询样式为：
+~~~sql
+SELECT slot_in_frame,
+       COUNT(*) AS sample_cnt,
+       COUNT(srsUeNiDb) AS ni_valid_cnt,
+       AVG(srsUeNiDb) AS ni_avg,
+       MAX(srsUeNiDb) AS ni_max,
+       AVG(CASE WHEN is_suspicious THEN 1.0 ELSE 0.0 END) AS suspicious_ratio
+FROM scoped_resource_rows
+GROUP BY slot_in_frame
+ORDER BY slot_in_frame;
+~~~
+scoped_resource_rows 是执行器已限定数据集、小区、时间和用户筛选的资源明细关系。此查询描述分布，无固定异常门限；可疑比是整行质量比例，不改称 NI 专属越界率。最小/最大 RB 只表示跨度，不能据此声称所有中间 RB 都被覆盖。
+
+### 4.7 图文检索与模型能力分支
+
+索引输入为 YAML 标题/标签/适用条件、故障表象、推理分节及图片视觉说明文本；按案例与章节/image_id 建立可追溯块，再做 BM25 与文本 embedding 混合检索。caption 的文本索引不等于直接对图片编码；不能保证只有图片、没有文字的特征一定能召回。
+
+召回图文案例后：
+1. 支持视觉的已配置模型：适配器读取经校验的图片内容，使用服务支持的图像载荷发送历史图与当前查询结果生成的图，附数据表、单位与来源标签。不能仅把本地路径字符串发给远程模型就认为其看到了图片。
+2. 纯文本模型或视觉调用失败：使用正文、人工 caption 与当前实测表解释，历史图片仍在界面展示供专家核对。没有 caption 时说明无法自动理解该图，不编造视觉特征。
+3. 生成或比较当前图前，记录横纵轴、单位、桶宽、时间范围和色阶；可采用一致显示尺度，但不得通过缩放隐藏差异。模型指出相似形态、不同位置/幅度及未验证项，而非凭“长得像”确认根因。
+4. 数值以原始查询结果为准；截图上无法精确读取的值标记不确定。图片、caption 与结构化数据冲突时并列说明，不无条件相信视觉输出。
+5. 区分 HISTORICAL_MEASUREMENT / CURRENT_MEASUREMENT / SCHEMATIC / FIELD_SCREENSHOT；历史图不能作为当前测量，原理示意图不能作为历史测量。
+
+图表资产与对应 artifact_id、结果哈希、绘图配置、caption 一起保存，报告可引用 [image_id] 和表号。为模型设置图片数量、文件大小与分辨率上限；被截取或省略的图片列入覆盖说明。
+
+### 4.8 图文固化、增量同步与版本一致性
+
+用户触发提炼后，在会话 drafts/ 下生成 YAML + Markdown 草稿，关联关键证据表；将选中的 Plotly/Matplotlib 图导出 PNG 并复制用户上传的现场截图到草稿 images/，自动插入相对引用和说明。图表导出失败时保留表格、交互图与待导出提示，不把不存在文件写成完成资产。
+
+审核表单预览正文、YAML 和图片，允许编辑 caption、删除不适用配图、上传截图；根因未知仍可保存探索草稿。保存操作依照 session/action ID 去重，正式提交时校验包内路径、图片可读性、字段和可选 SQL。路径必须解析在该案例目录内，不接受越界相对路径或用任意磁盘文件冒充图片；Markdown 内容、代码块和图片说明均为知识数据，不自动执行。
+
+新案例先完整写入临时目录并校验，再发布为正式案例包；更新既有案例使用基于 source_hash 的冲突检查，保留旧版本快照，避免覆盖专家同期修改。文件发布后记录 SQLite 同步任务；若进程在两步之间退出，启动扫描可依据包哈希补建任务，不假定跨文件系统与 SQLite 存在原子事务。
+
+kb_sync_manager.py 在启动、显式刷新或后台变更检测时，按 Markdown 与图片内容哈希增量同步：
+- 新增/修改：重新解析受影响章节及 caption，生成新版本索引；
+- 删除：当前检索不再返回旧索引，保留既有报告引用的历史版本；
+- 解析失败：显示文件、错误和上次成功版本，不静默用陈旧内容当新内容；
+- 重复 case_id：报告冲突，不随机覆盖；
+- 索引失败：案例文件保持已保存，可幂等重试，UI 分别显示保存与索引状态。
+
+SQLite 缓存、BM25 和 Qdrant 均能从案例包重建；审核记录、报告引用与证据元数据仍持久保存。已有报告绑定案例 revision、源文件哈希与图片哈希，后续人工改图不改变旧报告所依据的历史证据。
+
+
+## 5. Agent 状态、证据与流程
+
+### 5.1 状态契约
+
+`DiagnosticState` 至少包含：
+
+| 类别 | 字段 |
+| --- | --- |
+| 数据 | `session_id, dataset_id, dataset_fingerprint, data_root_dir, problem_context, mapping_id, pipeline_status` |
+| 基线 | `baseline_stats, field_availability, dropped_empty_columns, anomaly_fingerprint` |
+| 交互 | `interaction_action, user_input, target_filters, turn_id` |
+| 验证 | `candidate_cases, similar_cases, optional_verification_results, feature_spec, document_refs, query_plan, condition_results, sufficiency_results` |
+| 累积 | `table_artifacts, chat_history, confirmation_records` |
+| 输出 | `latest_output, case_draft, errors` |
+| 本轮任务 | `analysis_request_ref, analysis_context, parent_analysis_id, parent_bundle_ref, goals, completion_criteria, plan_revision` |
+| 循环 | `loop_state_ref, task_ledger, hypothesis_refs, missing_information, conflicts, budget, stop_reason` |
+| 单向交接 | `graph_version, phase, evidence_bundle_ref, evidence_bundle_hash, freeze_status, explanation_ref, report_ref, output_status` |
+
+`pipeline_status` 取 `UNLOADED / NEED_CONTEXT / LOADING / READY / PARTIAL_READY / FAILED`；交互动作取 `INITIAL_DIAGNOSE / FOLLOWUP_CHAT / CRYSTALLIZE_CASE`。READY 和 PARTIAL_READY 都可进入诊断，后者每份报告附加载范围与失败说明。
+
+数据指纹涵盖源文件内容、字段映射版本、输入契约与清洗配置。变更后重新建模并生成新数据版本，旧证据不能继续用于新版本结论。筛选变化更新当前分析范围，不必重新执行全量清洗。
+
+本轮任务、循环和单向交接字段为 v3.4 目标契约，详细定义见 §30。状态只保存引用及有界摘要；图版本与动作绑定，旧检查点不得按新图中的同名节点直接恢复。`phase` 顺序为 PLAN、ANALYZE、EXPLAIN、REPORT、DONE；ANALYZE 内允许循环，冻结后不得退回 ANALYZE。
+
+### 5.2 输出与不可变证据
+
+`ExecutedTableArtifact`：
+
+- `artifact_id`：新执行生成新 ID，不能覆盖历史结果；
+- `dataset_fingerprint, turn_id, title, purpose, sql, parameters, filters, query_hash, input_manifest_id, included_files, quality_policy, quality_scope, suspicious_ratio, coverage_summary, plan_id, rule_version, document_refs`；
+- `result_path, result_hash, total_row_count, preview_row_count, is_truncated`；
+- `markdown_preview, column_units, metric_sample_counts, is_pinned_evidence, chart_refs`。
+
+完整结果落盘，UI 分页读取，模型可看前 30 行预览及摘要；验证算子必须使用完整范围计算结果，不能从预览推断全表。
+
+`EvidenceClaim` 绑定 `claim_id, artifact_id, result_hash, row_key, metric, value, unit, scope`。差值、比例等派生值必须绑定可追溯的已执行计算。`evidence_validator` 检查数值、单位、舍入容差、范围与结果哈希；关键数字通过结构化 claim 渲染，不能只检查报告里是否出现表号。叙述不得扩大 claim 支持的范围。
+
+`DiagnosticOutput`：
+
+- `mode`：`SIMILAR_CASE_REFERENCE / FEATURE_DIAGNOSIS / EXPLORATORY_ANALYSIS / DATA_INSUFFICIENT`；
+- `conclusion_level`：`OBSERVATION / HYPOTHESIS / CONFIRMED`；
+- `similar_case_ids, similarities, differences, unverified_items, condition_results`；
+- `claims, reasoning_or_analysis_markdown, suspected_directions, case_asset_refs, chart_artifact_refs`；
+- `missing_data_and_limitations, suggested_followup_queries, confirmation_record_ids`。
+- `analysis_id, evidence_bundle_id, evidence_bundle_hash, explanation_id, report_id, goal_statuses, stop_reason, output_status`：绑定同一冻结证据包；取证完成状态与解释/报告生成状态分别记录。
+
+`SIMILAR_CASE_REFERENCE` 表示引用相似案例，不表示当前根因已匹配；特性分析使用 FEATURE_DIAGNOSIS。输出事实与假设分别标记，报告级别不得把所有陈述统一升级。`CONFIRMED` 必须有满足定案要求的外部证据或专家确认记录；专家确认标明身份/来源、时间、原话和依据，不能伪装成由 SRS 自动推导的结论。
+
+### 5.3 状态机与节点（v3.4 目标架构）
+
+~~~mermaid
+flowchart TD
+    S([START]) --> P[plan：明确问题 范围与完成标准]
+    P --> L[agent loop：动态取证 验证与冻结证据包]
+    L --> E[explain：综合解释与结论]
+    E --> R[report：关联分析步骤 数据与结论]
+    R --> F([END])
+~~~
+
+**流程入口**：数据加载与 ETL 在诊断图之外完成，构建或复用固定输入，支持 PARTIAL_READY，保留成功/重复/失败来源及质量计数。首轮与追问使用同一张诊断图，每次动作绑定一个数据集及固定 AnalysisRequest。普通问题沿用 §29 的默认直接执行，不新增逐工具人工确认。
+
+**plan**：结合问题、实际字段目录、当前筛选及兼容的历史证据，明确本轮目标、统计单位、分母、解释深度与完成标准，形成初始 AnalysisPlan。初始计划不是一次性固定 SQL 清单；loop 可依据新证据修订步骤，但不能擅自扩大问题范围或改变统计口径。
+
+**agent loop**：统一调度知识检索、字段检查、QueryPlan 查询、特性条件验证、时序/会话状态、授权范围内的比较和证据校验。每轮按实际结果更新目标、假设、矛盾和缺口，再决定下一步。SQL 语法/绑定错误最多修复两次，真实缺字段不盲目重试；保留成功结果和独立失败原因。出口完成问题覆盖与停止检查，冻结 AnalysisEvidenceBundle，详见 §19、§30。
+
+**explain**：仅基于冻结证据包，综合数据发现、规则和已有假设评估形成直接回答与解释。允许有依据的归纳推断，不新增观测事实、未经检验的关键前提或确定性归因；不查询业务数据、不检索新知识、不返回 loop。证据不足或存在冲突时明确限制，保留部分结论。
+
+**report**：基于同一证据包与已校验的解释，展开各步分析目的、方法、数据、发现和结论关联，支持从结论回查完整产物及来源。包含有效排除结果、残余问题、停止原因和加载覆盖；不独立重判原因，不执行补查。输出失败可在相同证据包上有限重试或降级，不回流诊断。
+
+**图外案例固化**：作为独立用户动作，将证据包、报告及讨论提炼为 Markdown 图文草稿，按 §4.8 归档并经用户审核保存。断言可选，未确认根因保留为探索记录；不能因本轮回答完成而自动发布案例。
+
+
+#### 5.3.1 默认探索对象与四类表
+
+没有特定任务要求时，指定 ue_uid 就分析该会话全部符合筛选的数据；仅指定 crnti 时，在当前小区和时间范围内列出其对应会话并分别统计，不能把复用 CRNTI 混为同一 UE。不对已明确选择的对象再套 Top-10 限制。
+
+未指定用户时，按当前范围内流控有效且可归属会话的原始记录数选择 Top-10 活跃 ue_uid，记录数相同按 ue_uid 稳定排序。此策略为展示优先级，不是异常严重程度排名；报告覆盖人数与总人数，不能据此声称全体用户正常。特性 B 的原因比例等用户要求的全范围统计不套用此默认 Top-10，必要时全范围聚合、Top-10 仅用于展开明细。
+
+| 表 | 范围与内容 |
+| --- | --- |
+| 小区 Slot/RB 分布 | 当前显式筛选范围内的均值、异常比与覆盖，不默认放大到用户未选的小区/UE |
+| UE/资源均值与波动 | 目标会话的均值、极值、rsrp_std、rsrp_trend_delta、异常/缺测比例 |
+| UE/资源/流对比 | 各流独立均值、样本数、流均值之差与异常比 |
+| UE/资源/流时序 | event_ts 时间桶内变化，表格与折线图切换 |
+
+四类表按实际字段可用性生成，不凑齐空表。全量分析指使用全部符合范围的数据计算，不要求把所有明细传给模型或一次渲染；分页/图表抽样必须注明。
+
+
+### 5.4 LLM 查询规划与实现边界
+
+AnalysisPlan 表达本轮业务目标与分析策略；下述 QueryPlan 是 loop 调用查询工具时的执行契约，两者分开版本管理。loop 可以生成多份有依赖的 QueryPlan，也可调用知识检索等非查询工具，不要求全部问题通过单份 QueryPlan 回答。
+
+QueryPlan 的最小契约：
+
+| 字段 | 定义 |
+| --- | --- |
+| plan_id、revision、dataset_id、dataset_fingerprint | 计划身份与固定数据版本 |
+| question、scope | 问题、当前小区/UE/资源及左闭右开时间范围 |
+| document_refs、case_refs | 文档段落及参考案例，含版本 |
+| field_bindings | 术语到实际字段的映射、单位与可用性 |
+| steps | 有序步骤，每步含 step_id、depends_on、purpose、operator、inputs、parameters、outputs |
+| condition_refs | 步骤验证的文档条件及三值逻辑 |
+| output_grain、result_key | 每行代表的对象及唯一键 |
+| quality_policy | EXCLUDE_ABNORMAL_RECORD，整行排除可疑和非法流数记录 |
+| expected_columns、units、denominators | 输出列、单位与比例分母定义 |
+| limitations | 缺字段、规则不确定与覆盖限制 |
+
+通用算子首版实现 FILTER、GROUP_AGG、CONDITION_COUNT、COMPARE、TIME_SLICE；文档有明确时序规则时使用 TEMPORAL_RELATE。字段、函数、运算符由白名单选择，值参数绑定；条件采用结构化表达式树，不 eval 模型生成的表达式。
+
+CONDITION_COUNT 同时生成条件聚合摘要和内部逐记录/事件状态关系 condition_evaluated_rows，后者保留对象键、B 值与各条件三值状态，供后续筛选使用。计划依赖必须指向实际产出的关系，不能从聚合计数反推异常记录。具体填写样式见同目录 query_template_style.md。
+
+执行器根据已实现算子编译参数化 SQL。FILTER 固定用户范围；GROUP_AGG 计算均值、计数和异常比；CONDITION_COUNT 计算 TRUE/FALSE/UNKNOWN；COMPARE 比较各组独立统计；TIME_SLICE 返回有界明细；TEMPORAL_RELATE 必须注明对象键、先后顺序、时间窗口和一对多处理方式，避免关联放大样本。缺时间规则时保留未知，不猜时间容差。
+
+常见查询直接编译；复杂需求可让 LLM 生成单条只读 SQL，但只读取受控当前范围的关系。首版不承诺理解任意 SQL 的全部语义：超出已实现检查能力的结果可作为探索表，明确标注限制，不用于自动判定特性条件或确认根因。特性自动判定优先采用可编译计划。
+
+示例查询次序：B 的取值分布 → 条件未满足与未知数量 → 有充分依据认定应生效但 B=0 的对象 → 佐证与时间切片。各步可按依赖执行并复用结果，设置单轮步骤数、时限与结果上限，防止无界自循环。查询计划摘要在界面可查看，常规查询无需逐条人工审批。
+
+### 5.5 数据充分性与解释边界
+
+只对当前任务的实际必需条件设门禁。描述性均值和异常比无需异常门限即可展示；缺测、少量样本或覆盖差异如实提示，不因可疑比例高而阻断出表。
+
+特性规则要求的字段缺失时，其条件为 UNKNOWN，不影响其他可判断条件；只满足必要条件不能宣布特性本应生效。需要具体时间关联而规则缺失时，不作该关联判断。数据为空时仍可说明文档和案例参考，但不能编造当前实测推断。
+
+无 CRNTI 的截断行无法归属某 UE 时，只报告文件/块级清洗情况。不同分析的分母必须明确，各条件观察覆盖不同不能隐去。
+
+### 5.6 SQL 执行边界
+
+模型 SQL、模板 SQL 和手动 SQL 统一走执行器：
+
+1. 解析并限制为单条只读查询及受控 CTE；允许的表/字段/函数白名单化，拒绝写入、DDL、ATTACH、扩展安装加载及外部读取。
+2. 参数值绑定，标识符来自实际 schema；只暴露当前 dataset_id 与用户筛选范围内的受控关系。
+3. ETL 与查询连接权限分离，查询连接关闭不需要的外部访问并固定配置。
+4. EXPLAIN 检查语法/绑定与计划，不替代安全或业务语义检查。
+5. 限制运行时间、内存、结果规模、并发和重试次数。预览截断明确标记，完整统计通过聚合计算。
+6. 记录计划、SQL、参数、实际范围、来源文件、结果哈希及错误。报告范围来自执行元数据，不由模型自报。
+7. 自动条件判断仅接收支持的算子/已检查查询结果；自由探索 SQL 的能力边界明确，不把“执行成功”当作“根因确认”。
+
+## 6. Streamlit 三栏工作台
+
+### 6.1 左栏：数据与靶点
+
+左栏增加历史诊断会话下拉框，显示会话标题、数据版本、最后访问时间与完整/部分加载状态。选择后按 §6.4 恢复；另提供目录加载、问题上下文、流水线状态、基线及 `logicCellId / ue_uid / crnti / 时间范围 / resourceId` 筛选。`phyCellInst` 可作为附加筛选。
+
+基线卡片显示“流控有效记录”“流控剔除率”“可疑行数”“缺测行数”，可展开逐文件与块级明细。分别展示结构/解析错误，不能与流控混算。
+
+### 6.2 中栏：解释与交互
+
+流式展示实际执行节点和状态；输出可核对的诊断依据，不展示无证据的内部猜测。引用案例显示“相似案例参考”，同时显示观察/假设/确认级别。无证据、部分缺失与技术错误采用不同提示。
+
+支持自然语言追问、快捷下钻和“提炼案例草稿”。用户改变靶点后，在新回答中明确当前范围；历史回答保留原范围。
+
+### 6.3 右栏：表格画布与审核
+
+表格卡片展示来源范围、样本数、单位、质量口径和 SQL。可疑整行高亮，缺测与解析错误另行呈现；排序/筛选通过明确控件或所选版本支持的组件实现。支持切换 Plotly 折线图/热力图，图轴、单位、桶宽与数据版本保持可见。
+
+图文案例召回后，中栏可显示历史参考图和文字，右栏显示当前实测图；也可在画布内并排展示，并明确“历史参考/当前实测/原理示意”。图片缺失或不能解码时显示具体原因，纯文本模型下仍允许人工看图。
+
+修改 SQL 后生成新的 artifact，并记录来源 artifact，不覆盖已被报告引用的表。置顶只表示用户认为重要，不自动升级为定案证据。
+
+图文审核表单提供 YAML 元数据、Markdown 正文编辑及渲染预览，编辑相似现象、推理依据、出处、适用条件与根因确认状态；支持关键图导出、现场截图上传、caption 编辑。查询和结构化判据可选。提交前校验包及可选查询，按 §4.8 写入案例包，区分“文件已保存”“索引待同步/已就绪”。
+
+右栏焦点状态使用经锁定版本验证的可控组件实现；不能假定设置 `active_right_tab` 就会自动控制 `st.tabs`。
+
+### 6.4 状态一致性与持久化
+
+`st.session_state` 保存 UI 选择和已提交操作 ID；LangGraph 状态保存诊断进度；持久化存储保存证据和案例。明确字段归属，不进行两个状态字典的无条件相互覆盖。
+
+使用完整 UUID 作为 `session_id/thread_id`。列表增量按消息/证据 ID 去重；每次用户动作生成操作 ID，Streamlit 重跑不能重复执行 SQL 或重复入库。使用 LangGraph SqliteSaver 保存检查点，内存保存器仅用于开发验证。
+
+session_registry.sqlite 保存会话与 dataset_fingerprint/数据库路径、manifest、schema 版本的关联，检查点表独立命名。DiagnosticState 只保存消息、计划、条件状态和 artifact 引用/小预览，不把完整宽表、所有 JSON 行或图片 base64 复制进每轮检查点。完整表和图表保存在会话 artifacts/，由 SQLite 元数据引用。
+
+恢复顺序：读取会话注册 → 确认固定数据版本与 ETL 完成状态 → 连接 analysis.duckdb → 恢复检查点与筛选 → 校验并分页加载表格/图表引用。不会重新清洗 CSV，也不会把当前源目录变化自动混进旧会话。新加载数据建立新数据版本与显式上下文边界。
+
+已完成的 SQL/入库操作按 action_id 查询状态，恢复不能重复执行；中途失败的步骤标记可重试，不伪造成功。缺少图表或结果文件时保留聊天和其他证据，提示缺失；仅在对应固定数据版本仍可用时允许显式重建，并生成新 artifact。实际恢复耗时取决于数据与资源，不承诺零耗时。
+
+### 6.5 模型配置与异常提示
+
+模型服务由用户在 `.env` 自行填写，提供 `.env.example`，不预置真实密钥或擅自选模型。LLM 和 embedding 分别配置 `PROVIDER / BASE_URL / MODEL / API_KEY / TIMEOUT_SECONDS / MAX_RETRIES`，完整键名见示例。默认超时 60 秒、最多重试 2 次，可由用户修改。是否必需密钥按服务适配器判定，支持无密钥本地服务时不强制填写。
+
+可选视觉能力也由 .env 配置：LLM_SUPPORTS_VISION 默认 false；如单独使用视觉服务，可配置 VISION_PROVIDER / BASE_URL / MODEL / API_KEY / TIMEOUT_SECONDS / MAX_RETRIES。适配器验证请求能力，不凭模型名猜测。未配置或不支持视觉时退回文本、caption 与人工图片查看；图像输入使用本地资产读取后的服务支持载荷。
+
+实际 `.env` 不入库，日志、错误信息、模型上下文和 UI 不显示密钥。记录非敏感模型标识与版本；embedding 模型变更后重建兼容索引，不能混合使用不同向量空间。
+
+| 异常 | 用户提示与系统行为 |
+| --- | --- |
+| LLM 未配置 | “尚未配置诊断模型，请填写 .env；数据加载与确定性统计仍可使用。” |
+| 鉴权失败 | “模型服务鉴权失败，请检查 API 密钥及服务地址。”不回显密钥，不反复重试鉴权错误 |
+| 超时、限流、服务不可用 | “本次模型分析未完成，已保留清洗数据和查询结果，可重试。”按配置有限重试 |
+| embedding 未配置或不可用 | 提示语义检索不可用，可使用 BM25 检索并明确标注降级；不能称已检索全部可能案例 |
+| 模型输出结构无效或证据不符 | 最多两次修复，仍失败则显示事实表与失败原因，不发布未经校验的结论 |
+| 输入部分失败 | “结果基于以下成功加载文件……”并列出失败文件、原因、成功记录及覆盖范围 |
+| 存在可疑数值 | “可疑记录已整行排除，质量统计保留，业务有效样本为 N。” |
+| 分组覆盖不同 | 正常展示各组独立统计，注明时间和样本覆盖差异，不强制丢弃或配对 |
+| 图片缺失或导出失败 | 保留正文/数据表，说明受影响图片，不能假装已完成图形比对 |
+| 视觉服务不可用 | 退回文本与已有 caption，并明确本轮未执行视觉对比 |
+| 会话关联的数据或证据不可用 | 恢复可用历史，标记缺失，不自动重新分析成新结果冒充旧结果 |
+| 无预置模板 | 根据文档和真实 schema 规划通用查询，不要求先填门限；必需字段或条件含义不明才提示 |
+
+服务失败不得清空已有成功结果；失败状态与“没有异常”必须区分。
+
+## 7. 确定性质量门禁
+
+| 门禁 | 强制要求 |
+| --- | --- |
+| 文件与块边界 | 单文件、原始记录顺序、连续块；不跨文件截断 |
+| 完整性 | 完整块全留；不完整块才截断；合法可空字段不构成流控证据 |
+| 数据充分性 | 首轮、追问和手动查询解释均按当前任务与范围检查 |
+| 质量统计 | 各组仅纳入业务准入记录中的有限值；异常/缺测/解析错误单列审计 |
+| 案例参考 | 相似即可提出；列明相似、差异与未验证项，不要求全部判据通过 |
+| 数字证据 | 校验真实数值、单位、范围、结果版本及派生计算 |
+| SQL | 统一受控只读执行与资源限制 |
+| 案例回流 | 人工审核、确认来源、可选查询回放、版本化与索引恢复 |
+| 特性分析 | 文档出处、必要/充分条件、三值判断、分母与重叠原因均须明确 |
+| 数据隔离 | 每个查询绑定单一数据集，不自动合并独立数据 |
+| 图文证据 | 历史/当前/示意图区分，表图哈希与版本绑定，caption 不替代精确数值 |
+| 案例单一源 | Markdown + 图片为权威源，SQLite/向量索引不独立修改正文 |
+| 恢复一致性 | 固定数据版本、已完成 ETL、检查点与证据引用一致才复用 |
+| 循环出口 | 每轮重新核账业务目标，区分完成、资料受限和执行未完成；任务为空不等于闭环 |
+| 单向交接 | 证据包冻结后 explain/report 不查询、不追加证据、不返回 loop；新问题生成新动作 |
+| 报告溯源 | 结论关联分析步骤、证据与规则；摘要和详细报告绑定相同证据包及结论版本 |
+
+## 8. 实施顺序与验收
+
+1. **数据底座**：先实现输入契约、稳定记录编号、日期解析、单文件块处理、质量统计、会话和四张表。使用真实脱敏样本与人工期望结果核对。
+2. **知识与计划**：实现 Markdown/YAML/图片解析、案例增量同步、文本与 caption 混合检索，再接入特性文档、通用查询算子和证据校验；定量断言可选。视觉模型按配置增强，不阻塞文本流程。
+3. **Agent 闭环**：覆盖相似案例参考、无模板自动规划、特性条件分析、证据不足、追问、查询失败及案例固化流程。
+4. **UI 与持久化**：完成四类探索表、表图切换、图文并排和 Markdown 审核；验证 DuckDB 数据复用、SqliteSaver 恢复、不可变证据、重跑去重及索引重试，再测试真实规模的内存与响应时间。
+
+最低验收矩阵：
+
+| 场景 | 预期 |
+| --- | --- |
+| 完整多行块 / 完整单行块 | 全部保留，末行不删除 |
+| 不完整块含尾部空 CRNTI | 按最后非空 CRNTI 边界截断，边界行也删除 |
+| 不完整单行块 / CRNTI 全空块 | 全块排除 |
+| 前缀存在不完整行 | 该行不能被保留 |
+| 同文件计数序列 `10,10,11,10` | 三个连续块 |
+| 两文件同计数值 | 分别处理，不串块 |
+| 可选测量为空但结构完整 | 不触发流控，进入缺测统计 |
+| 测量越界但 CRNTI 非空 | 不触发流控截断；整行退出业务统计，保留质量审计 |
+| 同行缺测与可疑 | 两种计数均计入，标签优先可疑 |
+| 无某指标有效样本 | 均值/分位数 NULL，有效计数为 0 |
+| 两天跨午夜、文件顺序颠倒 | 由 uwData + uwTime 得到一致时间 |
+| 日期无法解析但 CRNTI 非空 | 报告时间问题，不触发块流控或误删其他行 |
+| 会话间隔等于 / 大于 180 秒 | 分别不切分 / 切分；不宣称 UE 身份改变 |
+| 时间或 UE 筛选后的汇总 | 从明细重算，不能复用不适用的全周期汇总 |
+| 流均值为 1、2、4、8 dB | 均值之差为 7 dB；缺流时附覆盖限制 |
+| 预览未包含决定性记录 | 验证仍依据完整计算结果 |
+| 缺字段 / 查询失败 | INSUFFICIENT 或技术错误，不写成证伪 |
+| 报告数字或单位与表格不符 | 阻止该结论输出并要求修复 |
+| SQL 重跑、数据重载 | 新证据/数据版本，旧引用不可被覆盖 |
+| 审核保存后索引失败 | 保留权威记录并可重试，不重复创建案例 |
+| 可疑比例不同的多组 | 统一整行排除可疑记录，不按比例切换口径；逐组输出审计异常比 |
+| 非空 CRNTI 数值解析失败 | 单独报告解析错误，存在性仍为真，不触发流控 |
+| 仅尾部测量缺失、CRNTI 全非空 | 全块流控有效，不增加其他完整性条件 |
+| 各流样本时间不同、无共同记录 | 直接展示各流独立均值、差值与异常比，说明覆盖限制，不强制配对 |
+| 完全相同文件位于不同路径 | 仅计算一份，保留重复路径清单 |
+| 部分文件加载失败 | 分析成功数据，报告成功文件和失败原因 |
+| 源文件在快照期间变化 | 重试或报告失败，不发布不一致快照 |
+| 缺测、非法数字和非有限值 | 保留不同原因，后两类不混入缺测计数 |
+| 模型配置缺失或 API 调用失败 | 展示明确异常提示，保留已完成的数据与查询结果 |
+| 非空 CRNTI 但日期或身份解析失败 | 不触发流控，保留质量明细；无法归属会话时不合并为空 UE |
+| 相似案例没有结构化判据 | 正常展示相似点、差异、未验证项与排查过程 |
+| 没有预置特性查询模板 | 从文档和字段映射生成计划并编译支持的查询 |
+| 必要条件满足但 B=0 | 不直接判为软件异常；检查充分条件和其他触发要求 |
+| 特性条件或 B 缺失 | 标记 UNKNOWN，不当作条件不满足或 B=0 |
+| 两个条件同时不满足 | 各自计数并展示重叠，不将独立比例相加归因 |
+| 文档未明确条件优先级 | 不生成互斥的首因归类 |
+| 普通比较与特性时序规则 | 普通比较不强制配对；特性明文要求的关联独立执行 |
+| 不同数据集 | 查询与证据隔离，不联合求均值 |
+| Markdown 案例无图或无判据 | 仍可检索和展示参考，不要求补齐才启用 |
+| 修改 Markdown、caption 或图片 | 只更新受影响索引，报告仍引用原版本 |
+| 图片缺失/越界路径/无法解码 | 明确报错或降级，不读取任意本地文件 |
+| 纯文本模型 | 使用说明和表格，前端仍展示原图，不声称模型看过图 |
+| 图像与表格数字冲突 | 标记冲突，精确统计回到查询结果 |
+| 案例保存后索引失败或中途退出 | 文件包保持有效，同步任务可恢复重试 |
+| 恢复昨天的固定数据集 | 不重读原始 CSV，不重复 ETL，恢复原会话与证据 |
+| 未指定用户的默认探索 | Top-10 活跃会话展开，标明并非异常排名 |
+| 特性原因全范围查询 | 不套用默认 Top-10 限制 |
+| 多天同一时分秒的时序图 | 由 event_ts 区分日期，不合并两天数据 |
+| 图表预览降采样 | 明示粒度，完整统计不被预览改变 |
+
+模拟数据负责精确边界测试；真实脱敏数据负责确认“完整/截断”输入契约、清洗误删情况及专家诊断一致性。未完成真实样例验证前，不宣称生产级诊断准确率。
+
+
+## 17. v3.3 增量架构与执行契约
+
+本节与已修订质量条款组成新版本设计；实现进度见 docs/DESIGN_V33_IMPLEMENTATION_PLAN.md，不能将设计状态当作已经交付。
+
+### 17.1 字段目录与实际流数
+
+用户 Markdown 作为字段语义输入，经校验生成带源哈希、行号及冲突报告的结构化目录；JSON 仍管理解析类型和别名，不独立重复维护责任归属。空白不覆盖有效说明；重复同名条目冲突不能自动合并。范围写法统一展开，保留原出处，检索按字段或字段族组织。
+
+ueLayerNum 为有效流筛选依据，selLayerNum 不替代。空、0、负数、非整数、不支持值属于异常数据并整行排除。8 流四列输入保留实际流数并报告“仅覆盖前四流”。有效配置内的空值和零值不推断未激活；逐记录筛选，支持同一会话 1→2→4。各流均值独立分母，成对差值必须同记录成对有效。缺测分母只含配置内可观察流。
+
+instBfSinrGain 及其分子/分母归 L1测量；userNum 是任务内码分用户个数，不等同于整个 Slot 用户总数。责任层与 SCALAR/STREAM/BEAM 域独立；L1内部字段不全是算法决策。未填写归属标为待确认，未经确认的示例门限不自动用于判故障。isRsrp 有效索引小于 rxAntNum。
+
+### 17.2 问题需求与覆盖
+
+需求保存问题相关性、指标、维度、目的、范围、文档版本和出处。仅当前问题相关需求进入核账，RSRP/NI/增益均非强制项。Top-10 只影响显示，不能缩小问题 Scope。字段目录分别记录存在性、有效性和查询状态；全空、解析失败、范围无有效值、未查、失败、不支持不混同。
+
+覆盖必须关联成功证据及核查目的，SQL 出现字段不代表完成分析。零行结果可标记执行成功但证据不足；缺少业务准入记录时仅返回质量事实。旧的增益全空全局解释阻断移除。
+
+### 17.3 受控补查与案例路径
+
+v3.3 的流程为检索→需求整理→计划与字段来源校验→执行→覆盖核账→必要补查→验证→解释。v3.4 将这些能力纳入 §5.3、§30 的统一 agent loop，替代该固定串行编排；继续使用现有 QueryPlan 算子及安全 SQL 边界。限制总时间、轮数、字段批量、产物数；结构修复与补查分别计数，共享总预算。无进展、预算耗尽、重复失败或不支持时终止，冻结部分证据并输出未完成原因。
+
+检查点只保存需求、预算和不可变产物引用，恢复不重置预算或重复已完成工作。相似案例先展示再验证必要判据；不符合或证据不足转探索，不自动确认根因。保留特性、人工审核与回放能力。版本冲突时由用户确认，不静默覆盖人工指定。
+
+### 17.4 同侪比较及责任解释
+
+仅用户明确要求时启用同侪比较，模型不得自行扩大。按 logicCellId、分钟窗、相同 RB 区间、Slot、起始符号 ueSymPos 匹配，排除目标 UE；候选同样执行业务准入。缺少维度不得放宽匹配。自然分钟分桶作为当前实施默认，明确事件时间基准；多符号覆盖不能确认时排除比较并披露原因。基线需列聚合方式及各 UE 样本量；空间位置差异未受控，比较不证明因果。
+
+四类责任主体只形成有依据的排查方向。未核查不等于正常/免责，四流倒序不直接判故障，全空不推断采集故障。
+
+### 17.5 输出兼容、版本与性能
+
+模型输出仅允许原始 JSON 对象或完整单个 JSON Markdown 代码块；去壳后严格解析。artifact: 或 artifact：仅作引用包装，规范化后仍须匹配本轮完整 ID 并校验数值、单位和行键。表号只作显示别名，禁止猜测截短 ID。记录规范化动作及拒绝位置。
+
+新 ETL 与统计策略使用独立版本及内容身份，旧数据/会话只读保留，新结果重新加载计算。按需过滤补充字段再聚合，禁止默认全量 pivot。以 440 字段、约 3400 万行长表验证耗时、RSS、超时及恢复，不承诺未经验证的固定性能。具体分步验收和发布回退见实施计划。
+
+
+### 17.6 本轮实现边界与验证
+
+本轮实现与测试记录见 docs/V33_DELIVERY.md。核账目前针对明确指标及相关结构化 required_metrics，不声称自动理解全部自然语言判据。案例 criteria 使用带出处的 FeatureCondition；没有可执行判据时仅作参考。补查累计预算不包含独立模型 HTTP 重试的端到端保证。同侪只核对起始符号，已知多符号不纳入；缺少符号数量仍不能证明完整覆盖一致。所有未确认门限保持未知。
+
+
+### 17.7 SPF 与重复列口径（2026-10-27）
+
+CSV 精确同名列逐行合并，采用唯一非空值；相同非空文本去重，不同非空文本标记 DUPLICATE_VALUE_CONFLICT，不任意挑选。原始数组和逐列位置目录保留，冲突字段不可参与数值判定；CRNTI 原始存在性仍取各同名列是否有非空值，冲突不视为缺失触发流控截断。ETL 升级 m1.5，旧版本保留。SPF 规则以 knowledge_assets/features/SPF特性相关分析指南.md 为准，新增 isAiranActInd=1 必要条件；本期分别分析独立数据集，不做 A/B 自动关联。
+
+### 17.8 同行字段比较与 SPF 完整规则（2026-10-27）
+
+Expression 新增可选 value_field，用于 eq/ne/gt/ge/lt/le 的右侧列引用；value 继续表示绑定参数常量。value_field 与非空 value 互斥，is_null 不接受右侧操作数，逻辑节点只接受 args。例：`{op: le, field: preSinr, value_field: spfPreSinrThd}`。
+
+两侧都进入步骤来源校验和按需补充字段清单；同一关系之外的已知字段拒绝并报告 value_field 定位。真正不存在的字段按 UNKNOWN 处理，不编造值；右侧列名通过同一标识符白名单和转义规则进入 SQL，禁止任意 SQL 表达式、隐式跨表关联和跨数据集比较。类型/单位需兼容，不自动缩放。
+
+SQL 与 Python 特性求值采用一致三值逻辑：比较任一侧 NULL 为 UNKNOWN；AND 遇 FALSE 为 FALSE，否则存在 UNKNOWN 为 UNKNOWN；OR 遇 TRUE 为 TRUE，否则存在 UNKNOWN 为 UNKNOWN。完整 activation_logic 仅能引用条件 ID，右侧引用亦受限制。实际标志非0/1为未知，不能计入“应生效但未生效”。
+
+SPF 文档提供结构化 FeatureSpec：小区开关、模型激活、历史门限、用户形态开关、瞬时门限五个必要条件的 AND 为完整预期生效规则；实际状态取 codeUsrSpfFlag。逐行使用门限，精确保留 <= 边界；isAiranActInd=0 时不得预期生效。结构化规则直接执行，不依赖模型提取。模型类型只在实际生效前提下解释，不将未生效时的 spfModelType=0 当作3D生效；不由预期/实际不一致自动确认根因。
+
+
+## 18. 连续深挖、SPF 分层分析与证据溯源（2026-10-27）
+
+本节记录本轮讨论的业务决定与后续架构设计；当前已实现范围和限制见 §18.7，不能把全部设计目标视为已交付。下一步实施计划见 [连续深挖修改计划](docs/CONTINUOUS_ANALYSIS_IMPLEMENTATION_PLAN.md)。既有规则不变；SPF 实际生效比例的分母以本节为准。用户随后补充 ServiceError 日志，分析及方案记录恢复，根因未确认；详见 docs/issues/AH-010.md；P0代码及最小连通性验证已交付，复杂现场复验仍待进行。
+
+### 18.1 现状与目标架构
+
+P2～P6交付时的 LangGraph 为 retrieve → route → requirements → plan 或 rule_plan → execute → feature → states → coverage → verify → goals → report → explain。2026-10-28补充记录条件循环及最终解释回查，现有代码边界见 §19.8。以上为历史及现有实现记录；2026-11-10 确认的目标架构统一为 §5.3、§30 的单向流程，不再采用解释后回查。
+
+已知特性核验、描述统计、探索性诊断在新架构中作为同一 loop 的分析策略与工具能力，不再建立各自固定的顶层路径。结构化特性仍优先执行确定性规则；已有条件、时序、覆盖及一致性校验继续复用。所有任务共享范围、质量、预算和证据契约，模型不得自行扩大到同侪比较。
+
+### 18.2 已确认的两层统计口径
+
+条目级：N 为当前 Scope 内全部业务有效条目数；N_on、N_off、N_unknown 分别为 codeUsrSpfFlag=1、=0、缺失或非法的条目数。实际生效比例=N_on/N，实际未生效比例=N_off/N，未知比例=N_unknown/N。分母包含 flag 未知的业务有效条目；1−生效比例不能命名为未生效比例。N=0 时比例为 NULL/不适用。若另展示 N_on/(N_on+N_off)，必须标注“已知状态条目中的生效比例”，不得替换主指标。异常及可疑行继续整体排除，排除数保留质量审计。不按任务去重。
+
+用户级：本期仅在已有观测会话内分析，不跨观测会话拼接用户。沿用 logicCellId、CRNTI 和会话开始时间构成的身份及既有会话划分规则，不更改为仅 CRNTI 去重。报告人数时写“用户观测会话数”，不声称跨会话真实独立用户数。用户状态通常连续；生效与未生效交替时，重点分析状态变化原因，不以“曾未生效”替代整个会话状态。无法归属会话的有效条目仍可参与条目统计，但不合并成虚构用户，另列无法归属数量。
+
+### 18.3 状态序列、变化事件及解释边界
+
+按会话内事件时间组织业务有效观测，构造生效、未生效、未知的状态段及转换事件，保存起止观测时间、条目数、前后记录引用和数据覆盖限制。会话边界不产生跨会话转换。未知状态、采样缺口或被质量规则排除的间隔，不能填充为持续生效/关闭，也不能把未知两侧不同状态直接断言为已定位的转换。观测起止跨度不等于持续生效时长。
+
+相同时间的排序、同一时间不同资源存在不同状态，以及变化前后窗口均需明确契约；稳定 record_id 只用于可重复排序，不能充当真实时序依据。未解决顺序歧义时只发布观测差异，不确认转换先后。不得凭状态变化自动改变既有会话划分阈值。
+
+变化核验读取同一事件前后记录中的开关、isAiranActInd、SINR 与同行门限等规则字段。区分“该记录条件不满足”和“该条件在转换前后发生变化”。有依据时表述为“条件变化与状态转换一致”；所有条件满足而实际关闭时表述为“规则预期与实际不一致”；关键条件缺失时报告证据不足。不自动推断更深层根因、责任或免责，也不从 codeUsrSpfSw=0 单独确定终端形态/服务用户/互斥的具体原因。保留现有 <= 边界，不因自然语言简称改为 <。
+
+### 18.4 连续追问上下文与证据链
+
+每次分析保存 AnalysisContext：analysis_id、parent_analysis_id、dataset_id/fingerprint、Scope、质量策略版本、规则及字段映射版本、统计单位、会话身份定义、cohort_id、需求目标与预算。连续追问继承结构化上下文及已验证群体，不把上轮模型自然语言作为事实。v3.4 还保存原始问题、补充问题、用户纠正、parent_bundle_ref 及兼容的事实/假设/缺口，按 §30.7 新建动作走完整单向流程。指代存在多个候选时澄清；改变数据版本、范围、口径或规则时重新确定证据适用性，不覆盖历史结果。
+
+证据链为原始快照及行位置 → 标准化 record_id → 业务有效总体 → 观测会话/群体 → 状态段与事件 → 条件结果 → 分子与分母 → 比例及结论。每个派生产物保存父 artifact_id、输入群体、算子/表达式及参数、版本、完整结果位置和哈希。原因分析必须引用已生成的实际未生效群体，不由模型独立重建近似筛选。跨轮引用只能通过显式继承并验证兼容性后纳入本轮证据清单，不能放开任意历史 ID。
+
+比例使用 MetricSpec 绑定单位、分子产物、分母产物、去重键、过滤条件、未知策略和公式。模型仅引用程序计算值。条目、会话、转换事件三种单位不可混用。各原因允许重叠，原因占比不强制相加为100%；无明确优先级不得生成互斥首因。用户级“未生效群体”是否包含混合状态会话、原因如何归属会话，尚待确认；不能静默采用“曾未生效”作为最终分母规则。
+
+### 18.5 发布关口与部分完成
+
+覆盖按业务目标核账，例如实际生效比例、未生效条件分布、变化事件解释、原因占未生效群体/总体的比例，不能以字段查到或均值算出判为全部完成。每项目标保存 VERIFIED、INSUFFICIENT、FAILED 或 NOT_RUN 状态及证据引用。v3.4 在 loop 每轮及出口依据新证据重新核账，状态可升级或降级，记录理由与依据；冻结后不得由解释文字改写目标状态。
+
+发布前检查：N_on+N_off+N_unknown=N；原因集合属于对应未生效集合且后者属于总体；分子分母单位、范围、版本和去重键一致；五条件 AND 的真数量不得大于任一必要条件的真数量；预期真/假/未知数量守恒；实际与预期交叉统计边际一致；比例可从完整结果复算。完整 activation_logic 同样检查与必要/阻断条件的冲突，不能只验证条件 ID 合法。预览、Top-N 或抽样不能冒充全范围计算。
+
+失败仅阻断依赖该证据的结论，已核验事实可发布；保留失败位置和未完成目标。校验引用与数值不等于语义因果证明，不承诺消除全部模型幻觉。模型不可用时，确定性报告仍应给出已验证的 SPF 业务结论、范围、分母、未知项及限制，而非只有质量摘要。
+
+### 18.6 Prompt 契约与可恢复编排
+
+prompt 独立版本管理：任务职责/输出 Schema、领域约束、结构化上下文、允许证据清单和校验反馈分离。规划输入按问题筛选字段和规则；解释输入明确包含冻结包中的完整业务汇总、MetricSpec、目标状态、转换证据和限制，不能只给每表前10行。输出分离直接回答、已验证事实引用、包内已有的未定解释和未完成事项，精确数字由程序渲染。explain 不新增待验证关键假设或查询任务。修复时提供失败输出的必要且有界部分以及错误定位，不只追加错误消息；引用材料仍作为数据处理。
+
+状态中保存上下文、群体/产物引用、目标状态和累计预算，完整记录保留在数据库及不可变产物。恢复复用通过哈希和版本校验的证据，不重复执行已完成查询、不重置预算。字段按需读取，优先存储关系/群体引用，避免将海量原始行放入 checkpoint 或模型输入。模型调用、结构修复、查询与补查预算需显式记录，不能将当前局部预算声称为完整端到端时限。
+
+
+### 18.7 本轮实现与补充确认
+
+用户确认：本期仅展示相邻可排序有效观测及前后条件，未知或同时间冲突断开，不设自动归因窗口、不推断间隔内状态；用户级原因占比先不启用，先交付条目占比、会话状态分布及变化事件。
+
+已实现analysis.v1上下文、群体和比例父引用、特性直达规则计划、业务目标核账、会话观测状态与变化事件、显式记录群体/event_id追问及原始行回查。prompt使用diagnostic.v2。详情和限制见docs/P2_P6_DELIVERY.md；本节更新§18前述“拟实施”的对应范围，不表示自主根因循环或生产验收已经完成。
+
+运行时只为使用stream来源的计划展开流表；查询采用512MB DuckDB预算和短溢写目录，避免Windows深路径导致大样本临时文件失败。对每个观测群体，质量排除和群体之外的观测也构成时序断点。跨轮证据需显式选择，旧结果保持只读，不能自动导入缺少上下文的旧群体。
+
+
+## 19. 持续查询验证 Agent Loop（2026-11-10 修订；现有实现见 §19.8）
+
+### 19.1 用户要求与完成定义
+
+用户首次提问或再次追问后，系统应在问题限定范围及执行预算内持续查询、验证及补充证据；只要仍有必要且可执行的验证，就不能仅生成“待验证假设”结束，也不要求用户再发一次“继续查”。只有已完成问题必要验证，或查清当前数据/判据确实无法支撑剩余验证时，才分别声明本轮完成或资料受限，并明确尚缺哪些信息。预算耗尽、技术失败或无进展时仍可输出已核验事实和部分报告，但必须标明执行未完成，不能归为资料不足。生成假设、执行一条 SQL、字段存在、引用有效均不等于完成问题。
+
+本节为目标设计，§30 补充统一工具调度、冻结证据包、单向解释/报告和追问契约。2026-10-28 已实现的记录条件循环仍有算子与群体限制，见 §19.8；不宣称已具备任意领域的自主根因分析。§18.7 的显式追问与溯源本身不能代替循环验证。
+
+完成边界由用户问题决定。例如仅询问生效比例，正确计算并核验该比例即可完成，不主动无限追查上游根因；询问未生效原因时，则必须继续核验能够解释该问题的必要条件和残余异常。已有确定性规则可直接创建验证任务，不必先等待模型生成假设。
+
+### 19.2 目标图与循环职责
+
+```mermaid
+flowchart TD
+    A[绑定问题、范围、父群体和口径] --> B[拆解业务目标与验证任务]
+    B --> C[盘点证据和数据可用性]
+    C --> D{还有可执行的必要验证?}
+    D -->|有且预算允许| E[选择工具或生成查询计划并校验来源]
+    D -->|有但执行受阻| I
+    E --> F[执行工具并保存不可变证据]
+    F --> G[确定性核验判据与统计一致性]
+    G --> H[更新目标、假设、残余群体和缺口]
+    H --> C
+    D -->|无| I[复核停止原因与答案覆盖]
+    I -->|遗漏可执行验证| C
+    I -->|目标完成 资料受限或执行中断| J[保存停止原因并冻结分析证据包]
+    J --> K[explain 综合已有证据形成结论]
+    K --> L[report 展开每步分析及数据关联]
+```
+
+- 问题拆解：明确请求的统计量、分母、解释深度和范围。已确认的条目/观测会话口径继续继承；有歧义时澄清相关部分，其余独立目标可先执行。
+- 盘点/计划：结合全部相关字段目录、已验证产物、规则版本和来源，列出尚未完成的必要验证；按成本和依赖关系选取下一批查询。模型提出候选任务，程序决定其权限、输入可用性与执行合法性。
+- 执行/评估：QueryPlan白名单及来源校验保持有效。由程序计算完整结果、三值条件、分子分母及一致性，再更新假设状态；模型不能通过自述“已经确认”提升证据等级。
+- 缺口更新：区分数据未查询、数据确实缺失、字段映射未明确、判据缺失和技术执行失败。对残余未解释群体继续排队，而不是只报告已找到的一个原因。
+- 出口审核：在 loop 内完成必要推断的验证与回答材料完整性检查，随后冻结证据包。explain 和 report 只使用包内材料，均无返回 loop 的边；发现遗漏或冲突只能限制或删除受影响结论并披露原因，不自动补查。运行中展示的已核验事实须标为阶段性结果。
+
+### 19.3 状态与验证任务契约
+
+LoopState 引用既有 AnalysisContext、CohortRef、MetricSpec。状态包含 goals、completion_criteria、plan_revision、tasks、validation_tasks、hypotheses、evidence_refs、residual_cohorts、missing_information、conflicts、query_ledger、budget、stop_reason、round 及 checkpoint 版本。tasks 覆盖检索、字段检查、统计、比较、时序和验证，validation_tasks 是其中的验证任务；不再限定为已有特性群体上的记录谓词。只持久化引用和有界摘要，不把全部明细复制进图状态或 prompt。
+
+每个 ValidationTask 至少记录：task_id、goal_id、可选hypothesis_id、scope/cohort_id、所需字段与单位、来源关系、判据及版本/出处、预期支持与反驳结果、UNKNOWN处理、计划指纹、依赖任务、证据引用、执行状态及失败原因。没有来源的生产阈值、关联窗口或因果判据不得由模型编造；探索性描述可以执行，但不能将描述结果提升为根因确认。
+
+假设状态与任务状态分开：
+
+| 假设状态 | 含义与发布约束 |
+| --- | --- |
+| PROPOSED / TESTABLE / VERIFYING | 内部待验证，不作为已解释问题的最终结论 |
+| SUPPORTED | 查询结果支持明确判据；注明适用群体及证据等级，不自动表示因果成立 |
+| REFUTED | 当前范围证据不支持该假设；不能扩展为全局排除 |
+| INCONCLUSIVE | 已执行验证，但结果不足以支持或反驳，记录具体原因 |
+| BLOCKED_DATA / BLOCKED_CRITERIA | 经盘点确认缺少输入/映射或判据，列出缺口 |
+
+任务另记录 PENDING、RUNNING、SUCCEEDED、FAILED、BLOCKED，并与目标完成状态关联。一个查询成功不代表假设成立；整个集合只部分满足时，应拆分支持、反驳和未知的子群体，不能把少量支持样本推广到全范围。
+
+### 19.4 何时可以停止
+
+在权限、范围和执行预算内，存在未完成且可执行、可能实质影响本轮答案的必要任务时继续循环；不会因为模型已经产出一段看起来合理的解释而停止。每轮依据新增证据重新计算目标状态，既能从 INSUFFICIENT 转为 VERIFIED，也能因反证降级，不只沿用循环前状态。规划器返回空任务、任务队列清空、字段覆盖完整均不能单独证明闭环；出口检查完成标准、关键冲突及残余群体。
+
+| stop_reason | 判定依据 | 用户看到的含义 |
+| --- | --- | --- |
+| GOALS_VERIFIED | 本次问题必要目标全部有完整、兼容、通过校验的证据 | 正常完整回答；达到问题所需深度即可停止 |
+| DATA_INSUFFICIENT | 完成相关目录、映射、群体和数据有效性盘点后，仍缺少必要字段、时间覆盖、有效样本或关联信息 | 回答已验证部分，逐项指出缺失数据及影响 |
+| CRITERIA_REQUIRED | 有数值但没有可执行且可信的判据/口径，不能继续确认 | 说明缺少规则或业务定义；不能说成数据缺失 |
+| CLARIFICATION_REQUIRED | 指代、分母、范围等存在无法安全消除的歧义 | 提出必要澄清，保留独立部分结果 |
+| TECHNICAL_FAILURE / UNSUPPORTED_OPERATION | 模型、查询、算子或文件操作在有界修复后仍失败 | 明确技术未完成；不推断数据无法支持 |
+| BUDGET_EXHAUSTED / NO_PROGRESS | 累计预算耗尽，或多次无新证据且无法生成不同的合法验证计划 | 发布不完整状态、待执行任务及恢复信息；不宣称证据穷尽 |
+| USER_STOPPED | 用户主动停止 | 保留检查点和已验证事实 |
+
+DATA_INSUFFICIENT 必须有缺口证据：不能因知识检索只返回Top-3、预览只显示10行、字段未放入prompt、一次查询零行或模型说“没有数据”就判为缺失。零行可能意味着该目标群体为空：比例应不适用，或假设在当前群体不获支持；需按判据解释，不一律要求用户补数据。
+
+预算/轮数/单查询时限/内存/产物数仍需受控，不能为“持续深挖”无限执行。它们是执行保护而非业务证据。暂停恢复保留累计消耗；只有用户明确新增预算才能扩展预算，不能通过重试悄悄归零。预算阈值进入配置和运行记录，不在未实测时承诺固定轮数可以查清所有问题。
+
+### 19.5 缺失信息清单与最终发布关口
+
+每项缺口记录：关联goal/task/hypothesis、字段名或尚未映射的信息类别、缺口类型、期望粒度/单位、目标会话/群体/时间范围、已检查的目录/查询/产物、缺失或无效样本数（可以计算时）、阻断的判据、需要补充的数据或业务说明。字段名未知时写“需要哪类信息并确认映射”，不能猜一个CSV字段让用户提供。
+
+缺口类型至少区分 FIELD_ABSENT、MAPPING_UNRESOLVED、ALL_NULL、PARTIAL_MISSING、INVALID_VALUES、TIME_COVERAGE_GAP、JOIN_KEY_MISSING、CRITERION_UNDEFINED；技术失败、未查询和预算未完成不进入“数据缺失”计数。
+
+loop 冻结前逐个问题目标检查：证据完整性、数据版本和范围、父群体、分子分母单位及去重键、判据出处、查询全量性、数值和业务一致性、仍可执行的待验证任务。引用有效仅是必要条件。影响回答的候选原因必须在 loop 内提出并验证或记录具体阻碍；不得推迟到 explain 再取证。冻结后生成器新增包内无依据的原因时，输出校验拒绝该陈述并在同一证据包上有限修复，仍失败则降级；不创建验证任务、不返回 loop、不改写原停止原因。
+
+最终回答依次给出：直接答案与口径、已验证发现及证据引用、支持/反驳/未定的解释边界、缺失信息或技术未完成事项。因果未证实须直说，但不能用这句话替代仍可以完成的规则层面核验。对于确实缺数据的解释，可保留未确认方向并紧邻列出验证所缺内容；不能伪装成已确认根因。
+
+### 19.6 SPF 问题的验收主线
+
+以“SPF生效比例是多少，未生效原因是什么，占未生效用户和总用户的占比是多少”为例：
+
+1. 锁定全部业务有效条目总体，核验实际1/0/未知及生效比例，不将未知并入未生效。
+2. 创建实际未生效群体，逐条验证已确认五条件，分别核算各条件失败数量、重叠及相对未生效条目/总体的占比，绑定明确分子分母。
+3. 对“已知条件失败”的记录说明规则层面解释；对“条件缺失”的记录进一步核实是原字段不存在、映射问题、解析无效还是本范围缺测，列明缺失项。
+4. 对“五条件满足但flag=0”群体复核是否同条记录、同行门限、版本和质量口径一致，检查可用的相关阶段标志及已有明确判据。不能忽略残余群体，也不能仅凭不一致断定算法故障。
+5. 问题需要解释会话变化时，在单个观测会话内核验变化前后条件；未知、冲突和已确认断点继续遵守§18，不自行跨会话、扩张时间窗或开展同侪比较。
+6. 对codeUsrSpfSw=0等进一步解释，只在已有字段和可信规则能区分原因时继续细分；否则明确还缺终端形态、服务用户或互斥判据中的哪类证据，不默认选择一个原因。
+7. 用户级原因占比仍按此前确认暂不启用。自动循环不得借此重新启用、暗定分母或把条目比例改名为用户比例；回答应明确该项目待口径确认，不影响已授权目标继续验证。
+
+### 19.7 恢复、去重与防止无效循环
+
+规范化查询指纹包含数据/规则版本、范围、输入群体、算子、参数、统计单位和目的。兼容的成功证据可被多个任务复用；重复请求相同已完成查询不得计为新进展。恢复检查点后核验文件哈希与版本，恢复待执行队列而不是重跑全部工作。
+
+进展以新增有效证据、假设状态变化、残余群体细化或缺口得到证明衡量，不以模型文字变长或轮数增加衡量。查询失败可做有限修复；无进展时检查是否规划策略问题，不将其自动转为DATA_INSUFFICIENT。用户明确的范围、禁止跨会话拼接、同侪比较需明确请求等约束贯穿所有轮次。
+
+
+### 19.8 现有记录条件闭环实现与边界（2026-10-28，非 v3.4 目标图）
+
+截至本次设计修订，代码仍在 goals 后进入 loop_prepare → loop_plan → loop_execute → loop_evaluate → loop_plan。无待执行任务后进入 report → explain → completion_gate；最终解释新增必要判断时返回 loop_plan，最后由 finalize 输出确定性结果。explain 每个动作仅运行一次，回环后的结果由程序合成。此处记录现有实现，v3.4 待将完成检查前移至 loop 出口、取消解释回边并改为 explain → report；不得依据本节继续为新架构增加解释回查。
+
+实现为verification.v1（verification_loop.py）、prompt diagnostic.v3。TaskProposal仅允许已有goal、已有记录群体、Expression、ALL/ANY及可选已注册rule_id；程序生成CONDITION_COUNT计划并校验字段来源；无效任务批次不执行，允许一次带定位反馈的修复，计入相同累计预算。ALL遇到一条False即反驳，有未知且无反例则未定；ANY有一条True即支持，无True但有未知则未定；空群体不作空真推断。状态只对应明确的记录谓词，模型原始文字不会因绑定一个引用或一个支持的谓词而升格为已验证解释。
+
+完整True/False/Unknown计数来自Parquet全量结果，同时生成三类record_id子群体，供后续任务选择。任务指纹包括目标和量词；查询指纹独立绑定上下文、群体、单位、算子和规范化表达式，相同查询可用于不同量词而不重复扫描。仅复用缓存或重复提问不计作新查询；重复等价任务且没有进展时结束为NO_PROGRESS。
+
+已确认SPF文档新增verification_rules：codeUsrSpfSw条件失败的条目自动查终端形态及compFlag；预期生效但实际关闭的残余条目自动查两个筛选阶段标志。前者若形态和服务身份均满足仍关闭，保留交集群体并报告互斥/上游决策判据缺口；后者保留完整预期条件与实际不一致的群体，筛选标志只构成观测事实。未知条件仅在阻碍完整规则判断时自动补查，不因无关空值无止境扩展任务。
+
+缺口核验持久化LOOP_FIELD_INVENTORY，包含完整加载文件头和映射的检查结果、目标群体中的空值数和补充数值解析失败数；字段不存在于模型提示不构成缺失证据。字段不存在、映射不可用、全空、部分缺失、非法值分开。程序尚未实现通用的时间覆盖或关联键缺口检测，不能把当前记录谓词核验声称为任意时序/多表根因核验。模型无法将文字转换成任务时为NO_PROGRESS；这本身不证明数据或业务判据缺失。
+
+预算：SRS_VERIFY_MAX_QUERIES默认12（1～12），SRS_VERIFY_MAX_PLANNER_CALLS默认6（1～6），SRS_ANALYSIS_MAX_MODEL_CALLS默认12（1～24，规划/验证规划/解释共用）。它们与既有SRS_ANALYSIS_BUDGET_SECONDS共享累计调度时间；单次验证查询最多30秒，DuckDB内存限制512MB。模型适配器内的HTTP重试和空输出恢复仍受已有单次调用预算约束。该查询次数只统计循环追加的QueryPlan；基础统计、特性分析、状态分析和诊断目录读取另有日志，不把12次称为整个分析的SQL总数。进程总RSS可超过DuckDB限制。
+
+已执行查询先保存产物和账本，再评估；中断重试复用已成功查询，累计时间和调用数不清零。已发布结果保持不可变；预算耗尽后重新发起分析是新动作，不会修改旧结论。用户级原因占比、跨会话拼接、自动同侪比较和自由SQL探索不因此开放。
+
+开发验收及合成基准见docs/AGENT_LOOP_DELIVERY.md；现场GLM复杂输出和3875万补充行/4132列组合仍待实际机器验证。
+
+
+## 20. 数据命名与删除（2026-10-29）
+
+加载CSV时可输入1～100字符的数据名称，空名称自动采用输入文件/目录名加时间。显示名称存入会话注册库registry_datasets，以绝对数据目录为键；不写入不可变input_manifest.json，不改变dataset_id、fingerprint或既有证据哈希。同名数据允许存在，界面以版本ID短码区分。历史数据无需重载，自动显示“未命名数据”并可在已有数据管理中改名；新会话默认使用数据名称作为标题。
+
+已有数据管理提供创建会话、改名和删除。删除前显示关联会话数量并要求勾选确认，删除范围为本工作区datasets直属版本目录内的数据库、输入快照及该版本文件；不删除外部CSV源文件，不删除历史会话、报告和已生成证据。历史会话保留显示名，标记数据不可用；不能再发起查询或原始行回查，恢复分析需要重新加载数据。
+
+创建会话、诊断运行、改名和删除使用工作区内同一数据版本生命周期锁，分析占用时拒绝删除。删除再次核对dataset_id，仅接受受管理的直属版本目录；根目录、外部目录、隐藏构建目录及含符号链接/Windows重解析点的目录拒绝递归删除。操作失败明确提示，不声称删除成功。其他程序持有文件时需先释放占用；文件系统删除并非跨文件事务。
+
+
+## 21. 字段数据层级与小区参数连续补齐（2026-10-29）
+
+field_mapping语义表新增“数据层级”，与L1/L2/L3责任归属独立。支持小区级、用户级、资源级、流级、波束级、记录级或待确认；空白不推断。当前确认srsSpfSwitch、spfPreSinrThd、spfPreSinr3D4DThd为小区级，所有重复定义均同步标注。层级冲突禁用该字段的自动补齐，保留审计；兼容旧三列表。
+
+“小区级参数连续众数填充”在本版明确实现为保守的连续同值段规则BRACKET_EQUAL，不是全数据集众数覆盖。共享键仅logicCellId，不区分载波/BWP；同数据集按event_ts排序，无最大时间间隔。前后最近可信观测相同才补齐中间原始缺失；同时间只有一个有效值时也允许共享给该时刻的缺失记录。不同值、同时间多值冲突或非法值形成边界，不能跨越；同时间存在多数票也不覆盖冲突。单侧缺失、无小区身份、无事件时间均不补齐。srsSpfSwitch仅0/1作为可信来源；门限不缩放。
+
+加载时将字段层级哈希、确认字段及cell-continuity.v1策略写入输入契约，参与数据指纹；完成原有清洗后，从业务有效且无解析错误的记录计算cell_parameter_fills。来源不受后续UE/时间范围筛选影响，只限同一固定数据集和小区；这属于共享参数解析，不构成自动同侪性能比较。原始快照、l2补充数值、质量标记不改写，异常行不会因补齐恢复业务准入。原ETL质量版本保持不变，补齐采用独立策略版本。
+
+cell_parameter_fills按record_id/field_name唯一存储推定值、前后来源record_id、时间、支持数及方法。查询只为计划需要的字段关联补齐值，同时导出__cell_raw_原始值和__cell_fill_来源结构。完整产物及验证结果记录使用推定值的记录数量；SPF报告保存原始条件计数、原始预期状态计数以及补齐后结果。会话状态变化证据携带对应来源，不把补齐后的条件变化称为纯实测变化。原始行回查允许本轮记录和证据中明确引用的小区参数来源，不能扩展为任意其他用户记录。
+
+Prompt diagnostic.v4要求模型不得自行填值、取全局众数或无限前向填充，含补齐的判断必须标明推定。旧数据集不自动补写，必须重新加载才能应用新层级和策略；修改字段层级后也需重新加载。历史报告和数据指纹保持原样。
+
+## 22. 从已有数据重新加载（2026-10-29）
+
+“已有数据管理”新增“重新加载数据”，可指定新名称并选择输入契约。默认沿用原版本的编码、日期格式和已固定的字段别名，应用当前代码的清洗规则和当前字段语义表的小区参数补齐策略；若需要更新CSV别名，可明确选择配置文件中的输入契约。
+
+重载仅使用父版本清单内的CSV快照，逐个验证SHA-256，不读取原目录后来新增或修改的文件。支持首次以任意CSV文件名单文件加载的版本。快照缺失、内容变化或复制失败时终止重载，不静默丢弃输入；缺少快照时需通过“加载CSV”使用原始文件。父版本在操作期间持有生命周期锁。
+
+成功后生成新的dataset_id和独立数据库，保存reload_of父dataset_id、fingerprint及VERIFIED_SNAPSHOT来源；旧版本、会话与报告保持不变。界面自动选择新版本并创建新诊断会话。全部解析失败不切换；部分成功显式警告并提供加载清单。重载是完整ETL，耗时和空间开销与重新导入相当，需容纳新数据库和快照；失败构建保留在隐藏构建目录用于诊断。
+
+## 23. 证据画布的可读展示与图表（2026-10-29）
+
+右侧以“选择画布内容”下拉框切换统计与图表、查询证据、特性条件和案例审核。查询默认展示基于已保存结构化计划生成的中文说明；按产物自身query_plan及plan_id匹配步骤，避免特性计划和验证计划复用步骤编号时错配说明。无法确定语义的探索查询仅说明结果范围，不由模型猜测SQL含义。SQL、绑定参数、计划编辑与探索入口由“显示技术详情与高级查询”开关展开。
+
+已通过一致性校验的特性结果展示实际生效/未生效/未知条目占比，分母为当前范围全部业务有效记录；零分母或校验失败不绘制比例。条件不满足图同时标注占未生效条目与占全部业务有效条目的比例及分子、分母，条件可重叠，不表示用户级原因占比或已确认根因。
+
+会话状态图从已核验哈希的SESSION_OBSERVATIONS证据读取最多2000个观测点，包含未知、冲突和断点，不连接点或推断采样间隔内连续状态；明确标注预览上限，完整证据仍可下载。变化/切换/趋势/时序问题默认展开此图，无观测证据时提示缺失。特性条件用中文条件与满足/不满足/未知计数表展示，完整结构保留在详情中。
+
+## 24. 预算诊断与可选语义检索限时（2026-10-30）
+
+现有实现的分析总预算默认120秒，从知识检索前计时，覆盖前置统计、特性核验、追加验证及模型解释；重试沿用原动作预算，不自动重置。v3.4 按 §30.8 前移至 plan 入口计时，并覆盖解释与报告，记录预留预算及确定性降级。可选语义检索子预算 SRS_RETRIEVAL_SEMANTIC_SECONDS（默认10秒，0～60）与所属阶段和总剩余时间取较小值。超限时保留 BM25 结果，不让可选语义向量冷缓存生成占用全部后续预算。子预算嵌套不能延长父调用 deadline；本地索引操作仅在阶段边界检查。
+
+验证循环budget_exhaustion记录耗尽维度TIME、QUERY_COUNT、PLANNER_CALLS、MODEL_CALLS、MODEL_CALL_OR_SERVICE或UPSTREAM_BACKFILL，以及剩余秒数、查询/规划计数和待办。规划已完成不再次触发预算门禁；查询次数用满后允许确认无后续任务，新增查询仍受限；已成功落盘的查询可在额度耗尽后恢复评估。真实未完成任务仍保留BUDGET_EXHAUSTED，不伪装为DATA_INSUFFICIENT。
+
+每轮结果及diagnosis性能记录增加budget_diagnostics：总上限、累计墙钟耗时、剩余预算、首次进入循环时剩余预算、模型次数、语义子预算上限和按节点累计执行耗时。节点耗时与总墙钟包含范围不同，重试等待也消耗总预算，不要求节点耗时之和等于墙钟耗时。界面在“持续验证任务、停止原因及缺口”显示预算与阶段耗时。排查须结合现场日志，不仅凭停止枚举判断性能根因。
+
+小区参数的行级解析限制问题见AH-017；字段级准入方案待用户确认，本节不改变§21已确认的数据补齐规则。
+
+## 25. 字段级小区参数质量守卫（2026-11-04）
+
+本节更新§21的来源准入：cell-continuity.v2采用BUSINESS_VALID_FIELD_VALID，在既定业务范围内按小区标识、时间、CSV结构和目标字段质量判断。无关字段解析失败不阻止有效小区参数提供来源，也不阻止目标缺失值接收推定。目标字段非法、非有限、重复冲突，以及CSV错位均形成时间边界；核心字段已归一化NULL时仍检查error_reasons及原CSV别名，不把非法值当普通缺失。策略快照在输入别名加载后生成，携带字段别名参与指纹。原始异常与业务准入口径保留，旧版本需重载。
+
+现有实现中，验证停止于预算耗尽、技术失败或无进展时，停止可选模型/视觉解释，保留事实报告、已完成证据与具体未完成原因。v3.4 中取证或视觉比对一律在 loop 内，停止后按 §30 输出部分证据包；explain/report 可用确定性方式降级完成，不能在无剩余预算时额外调用模型。现场300秒预算下176.11秒结束不能直接归因为总时间耗尽，应读取明确的耗尽维度和次数计数。
+
+## 26. 问题解析与分析范围确认（2026-11-05，待实施）
+
+正式分析前新增“问题解析与范围确认”阶段，顺序为问题输入 → 解析候选 → 用户修改/确认 → 固定分析请求 → 检索、统计、规划、验证与绘图。此节是新增设计，不代表当前代码已支持自然语言范围识别。实施计划见docs/QUESTION_SCOPE_IMPLEMENTATION_PLAN.md。
+
+### 26.1 语义映射与对象解析
+
+字段语义目录支持canonical_field、中文名称、提问别名、已确认含义、单位、缩放及原文出处；CSV输入别名与提问别名分别管理，避免将用户说的TA当作CSV列重命名。TA候选映射到taValue，只有字段实际可用且语义无冲突时才可绑定；单位和缩放未经确认，显示原始数值，不换算时间或距离。映射更新参与请求绑定版本，不能仅依靠模型猜测。新增字段以已确认映射配置即可接入，不为每个指标单独硬编码查询。
+
+“1911这个用户”“CRNTI为1911”等明确表达解析为crnti=1911。仅出现孤立数字、多个可能字段或指代对象不明时标记待澄清，不自动猜测。十进制/显式十六进制按明确格式解析，保留原表达及转换结果并检查取值范围。文本内未指定的小区、时间等继承界面范围；明确冲突不能静默覆盖或取交集，必须展示两个来源供用户选择。相对时间无确定基准、时区不明或只有部分日期时不能补造时间。
+
+CRNTI不视为全局永久用户标识。同一CRNTI跨logicCellId或多个ue_uid时分别分析，确认页展示小区和观测会话数量，不能无提示拼接为一条用户轨迹。数据集、时间、对象筛选不匹配时明确报告零样本，不扩大范围寻找结果。
+
+### 26.2 确认交互与不可变请求
+
+界面显示原问题、数据版本、对象筛选、时间区间及端点口径、指标及其实际字段、单位/缩放状态、质量口径、分组、图形形式和待确认项。以“1911这个用户的TA变化”为例：crnti=1911、TA→taValue、小区和时间沿用界面、按小区及观测会话分组、时间折线图、未确认单位则原始数值。用户可以编辑，点击“确认并分析”后才执行正式业务查询；此前仅允许范围预检、字段目录与样本数量核对。
+
+确认后的AnalysisRequest持久化原问题、解析修订号、解析器版本、字段映射版本/哈希、数据集ID/指纹、Scope、指标、统计/质量口径、分组、图形规格、未决项和确认时间，并生成请求哈希。所有基础统计、模型计划、补查、验证循环、图表和报告使用同一确认请求；模型只能在此范围内工作，不能另行重新解释用户编号。新解析、字段映射变化或编辑范围使旧确认失效；重试复用同一已确认请求，不能用后来UI状态覆盖。追问群体仍受父证据群体约束，范围冲突需新建分析。
+
+### 26.3 趋势查询、图表与处理步骤展示
+
+“趋势”是分析目标，时间折线图是默认展示形式；只有已确认状态保持语义时才使用阶梯线。按event_ts排序、按logicCellId与ue_uid分组；缺测、异常、会话断开处分段。同时间多值不得凭record_id构造先后顺序，保留冲突或采用用户确认的聚合口径。采样稀疏与缺口标明覆盖情况，连线不证明观测间隔内的变化过程。首版不自动插值、平滑或推断用户移动，单位不明不生成物理含义结论。
+
+完整时序证据落盘，预览限制与全量统计分开；报告给出有效样本、起止观测、最小/最大值和可验证变化，禁止仅凭预览判定全范围上升/下降。大数据需明确时间桶及聚合口径，改变桶宽或聚合必须体现在请求与图例中。
+
+执行中展示解析/确认、检索、查询、验证、绘图各阶段的等待、执行、完成、失败或跳过状态，附耗时、证据及未完成原因；不为每次范围内补查请求确认。扩大数据/对象范围、改变统计口径或引入未确认语义时暂停，展示差异并再次确认；确认后生成新请求/动作，保留原动作和证据。
+
+## 27. 问题确认首版实施与兼容边界（2026-11-05）
+
+§26已按Q1～Q5交付首版，具体行为和边界见docs/QUESTION_SCOPE_IMPLEMENTATION_PLAN.md实施交付段。AnalysisRequest含revision_id/request_hash，字段语义来自独立JSON配置，固定请求写入动作和结果；新界面先解析后确认，旧直接API和手动高级查询兼容原路径。当前不自动扩大Scope，范围/语义变更必须新确认；文本时间由用户编辑完整时间，未实施任意自然语言日期识别。
+
+时序当前按原始观测点，不自动聚合桶宽或生成升降趋势分类；同时间冲突/缺测/质量排除断开，原始record_ids随完整证据保存。完整分组统计包括首末有效值、有效点数及极值，图最多预览2000点。TA单位/缩放未知，不进行换算。节点状态及累计时间写入budget_diagnostics.stage_status/stage_seconds，失败保留动作以便重试；重试绑定原确认请求。
+
+## 28. 现场可靠性与证据呈现修订（2026-11-09）
+
+关联问题 AH-020～AH-027，详细定位及验收见 docs/issues/AH-020-027.md。以下为本轮本地实现契约；生产现场文件占用根因及大表性能仍需复验。
+
+### 28.1 恢复状态与持久化故障
+
+关键动作状态由 session_registry.sqlite 的 action_progress 表保存，按 session_id/action_id/request_hash/revision 绑定，事务提交后才更新内存状态。已有动作锁与修订检查防止同一动作并发覆盖。SQLITE_BUSY/LOCKED 最多三次短重试；其他持久化错误直接报告 STORAGE_FAILURE。关键预算预留、产物引用和验证队列不能静默丢弃；旧图保存解释消费状态，新图保存证据包冻结及 explain/report 交接状态，互不套用。保存失败时停止并保留已落盘证据，不宣称分析成功。阶段耗时属于可降级遥测，其保存失败不遮蔽原始业务异常。
+
+不再生成或替换 progress_*.json；已有 JSON 按原动作文件名及 registry 中的请求绑定迁移，并校验已有产物哈希，损坏时拒绝恢复，不重置预算。事务状态为恢复依据；LangGraph checkpoint 使用 session_id:action_id 隔离，不能把另一动作的节点状态当作当前进度。最终结果仍通过不可变文件及注册表哈希保存。SQLite 并非所有磁盘故障的兜底，持续锁/权限/磁盘故障仍会明确停止。
+
+### 28.2 排序、完整证据与覆盖预览
+
+窗口函数的 ORDER BY 只约束计算，完整时序在最终导出时按 logicCellId/ue_uid/event_ts 显式排序，绘图再按对象、segment、时间稳定排序。原始同时间记录不得用 record_id 伪造先后；同时间质量阻断点的 value 为 NULL，不纳入有效点统计。
+
+表格完整结果不超过100行时全部展示；超过时最多选择25个稳定哈希分组，每组保留首末观测和两个哈希样例，共不超过100行。分组键来自可用的小区、会话、状态。preview_policy 记录方法及覆盖范围；无法低成本获得组总数的流式产物标为未知，不伪造总数。这是覆盖样例，不是无偏随机样本，不用于估计总体比例。
+
+图形先明确选择对象，支持按会话编号筛选；每次最多列出500个匹配对象，超过时提示收窄筛选。每个对象不超过2000点时完整绘制，超过时在各 segment 内按有序观测分桶，保留桶首末及极值；状态观测采用已有 segment_index。过多分段超出额度时明确记录遗漏段数。图形降采样不改变分析口径、完整 Parquet 或统计值；缺口和会话边界不得被跨越连线。
+
+### 28.3 统一摘要、报告与数值引用
+
+通用 FILTER/GROUP_AGG/CONDITION_COUNT/COMPARE/TIME_SLICE/TEMPORAL_RELATE 和指标时序生成 evidence-summary.v1。摘要在已执行关系上计算，包含字段类型、列单位、来源关系、父产物、分组/步骤、全量计数/范围/缺口和 limitations。摘要保存为独立 .summary.json，内容哈希及原 Parquet 哈希绑定到结果；读取时校验。分组摘要最多200组，截短显式标记，完整结果保留。
+
+确定性报告读取这些摘要，即使模型未配置或失败，仍能发布有证据的通用算子结果。FILTER/TIME_SLICE 分母是其直接来源关系行数，不偷换为全数据；CONDITION_COUNT 分开 True/False/Unknown；COMPARE 为组内 max-min；TEMPORAL_RELATE 为对象键及前向窗口内是否存在观测，不是配对数量或根因。对 GROUP_AGG 不再平均各组均值冒充总体均值。时序报告给出分小区/会话的首末、极值和覆盖，正文最多20个会话，画布保留完整分组表。
+
+模型可通过 artifact_id + row_key.fact_id + column=value 引用摘要事实，或通过唯一原始行键和 column_units 引用原始产物；核验摘要哈希、原产物哈希、单位与数值。动态单位依据源字段与算子传播，count 使用 count、差值继承源单位；未经确认或仍需缩放的字段使用 raw，不任意推断为 dB。旧无摘要产物继续兼容旧白名单。
+
+模型 evidence 保持列表入口，每个产物提供完整摘要及最多6个覆盖样例；证据部分默认32000字符，整个解释主上下文默认64000字符。移除重复的大型产物内容并显式标记被省略的上下文字段，省略不代表数据不存在。v3.4 将必要定向核验全部放在 loop 冻结前完成，不能因解释上下文截短而返回查询；冻结包保留目标级完整摘要和完整证据引用，后续按目标分段读取包内结果，不以样例完成总体结论。该限制是字符上限而非模型精确 token 上限，服务商输出/上下文限制仍受原服务层约束。
+
+计划限制在正常报告及证据详情可见；模型生成的原计划限制标记为计划自述，不等同于已核验的数据缺失。原有 SPF、会话状态与验证循环专用报告保留。新增 artifact_export/evidence_summary 阶段耗时进入 performance.txt。
+
+### 28.4 意图一致性与本次身份说明
+
+统一 question-intents.v1 识别趋势、变化、随时间、走势、波动、切换等及局部否定表达；确认请求的 trend 为新界面的执行与展示依据。不能仅凭“突变”创建异常阈值或因果判据，未知阈值时只描述观测。
+
+当用户说明“所有CRNTI实际都是一个用户”时，确认页提示候选，并要求显式勾选“我确认当前范围内所有 CRNTI 属于同一用户（仅本次分析）”。subject_assertion 类型为 USER_ASSERTED_SINGLE_SUBJECT，包含当前 Scope、数据指纹、用户原句，随请求哈希固化。不得自动清空已有 CRNTI 过滤，需在确认页核对；父群体仍对查询范围生效。新分析默认不继承该声明，范围变化需重新确认。
+
+该声明只改变本次分析视角，不改写底层 CRNTI/ue_uid 或会话划分。时序产物携带原始 crntis 和 record_ids，各小区/接入会话分别展示，段间不连线，不根据无观测间隔推断轨迹或切换时刻。报告明确声明来源为用户本次确认，不声称由数据自动证明同一真实用户。
+
+## 29. 默认直接执行与简化过程展示（2026-11-09）
+
+按用户最新界面要求，本节替代§26～28中普通问题必须二次点击确认的交互规则。点击“开始分析”后，程序解析问题并结合当前界面范围，自动生成固定AnalysisRequest后直接执行；execution_mode标记为AUTO_FROM_QUESTION，不伪记为手动确认。请求版本、映射/范围哈希、父群体约束、证据核验与预算机制保留；仅编辑问题或刷新界面不会触发执行。
+
+中间区域用一句“查询逻辑”说明本次对象、时间范围、指标、业务有效口径，以及适用的父群体、同侪或时序分段规则。该句由实际请求生成，不展示内部思考，也不将预期查询行为当成已得到的结论。执行仅显示简短状态；逐节点过程留在日志和右侧证据详情。历史回答保留正文与失败/未完成提示，范围、引用及校验细节默认折叠。
+
+只有解析确实不能确定唯一有效范围时（文本/界面冲突、多对象歧义、未解析时间等），才显示修正入口，不默默查询错误对象。未明确字段单位继续使用原值，未指定的范围沿用界面，不自动扩大范围。
+
+用户在问题中明确陈述“所有CRNTI实际都是一个用户”时，可直接将该陈述绑定至本次请求，subject_assertion.source记为EXPLICIT_USER_STATEMENT，无须再次勾选；疑问、否定或假设表达不自动转为身份事实。声明仍仅在本次固定范围内生效，保留各接入来源，不跨段连线。手动冲突修正入口仍可显式确认身份，旧请求保持兼容。
+
+## 30. 统一专家分析 Agent Loop 与单向交付（2026-11-10，已确认设计、待实施）
+
+### 30.1 架构决定与适用边界
+
+顶层固定为 `START → plan → agent loop → explain → report → END`。agent loop 完成本轮所有必要取证与验证，explain 基于其结果进行综合解释和结论组织，report 进一步展开与每步分析数据关联的报告。explain/report 均不返回 loop；用户补充问题后创建新动作，再进入完整流程。
+
+“本轮能够拿到的所有数据和信息”指在固定数据、问题、口径及可用知识范围内，可能实质影响回答的必要证据已经取得或已确认其获取阻碍，不要求扫描全部列、穷举全部字段组合或检索全部案例。不将无限扩大问题当作深入分析，也不以减少节点数作为可靠性证明。预算耗尽、技术失败、无进展只表示未完成，不能声称已穷尽可用信息。
+
+本次仅更新设计，不宣称代码已完成迁移。数据加载/清洗、数据管理、案例草稿及人工发布仍在主诊断图之外；数据集隔离、流控、业务准入、统计口径、同侪比较授权和 §29 的直接执行交互均继续有效。
+
+### 30.2 plan：形成可调整的业务分析计划
+
+plan 输入固定 AnalysisRequest、实际 schema/字段目录、当前界面范围、用户说明及显式继承的历史证据。必要的 schema/来源元数据可在入口读取；新的业务文档检索、数据取证及假设核验由 loop 执行，计划中的待确认规则不能当作事实。
+
+AnalysisPlan 至少记录：
+
+| 项目 | 契约 |
+| --- | --- |
+| 身份与上下文 | plan_id/revision、analysis_id、request_hash、数据及规则版本、父分析引用 |
+| 本轮问题 | 原问题、补充问题、用户纠正、effective_question；区分新增目标与被修正的旧假设 |
+| 范围和口径 | Scope、cohort、分析单位、MetricSpec、分母、质量策略、允许比较的对象 |
+| 业务目标 | 每项 goal_id、要回答的内容、所需解释深度、完成标准及依赖 |
+| 初始策略 | 待检索知识、待查指标、候选工具和依赖；未知字段/规则显式保留待解析 |
+| 执行约束 | 工具能力目录、总预算、阶段预算、重试与产物限制 |
+
+完成标准必须对应问题：均值问题要求范围、单位、样本和质量口径及已计算值；原因问题要求候选条件的证据、影响范围、比较口径、反证及未解释部分；根因问题需要相应的业务或因果判据。没有判据时不得将关联结论升级为根因。loop 可修订实现步骤与补充子目标，但不能以降低完成标准绕过原问题，也不能擅自增加用户未授权的分析范围。
+
+### 30.3 agent loop：动态工具调度与逐轮核账
+
+内部以可持久化子图或等价状态机实现“盘点 → 选择行动 → 校验并执行 → 评估结果 → 更新目标与缺口 → 出口检查”。顶层一个 agent loop 不意味着把全部能力写成一次无检查点的长模型调用。
+
+| 工具类别 | 能力与约束 |
+| --- | --- |
+| 知识检索 | 按当前问题、假设和缺口检索字段、特性文档、案例及图文资产；保留版本、出处、相似点和差异，Top-K 未命中不等于知识不存在 |
+| 字段与覆盖盘点 | 查完整目录/映射及目标范围内有效性，区分未查询、缺失、全空、解析异常和覆盖不足 |
+| 通用数据查询 | 复用 FILTER、GROUP_AGG、CONDITION_COUNT、COMPARE、TIME_SLICE、TEMPORAL_RELATE 及原有受控执行器；按需读取列，不局限于 CONDITION_COUNT |
+| 特性及状态分析 | 执行可信 FeatureSpec、三值条件、残余群体分析、观测会话及变化核验；既有时间/身份边界不变 |
+| 对象及指标比较 | 在请求授权范围内比较 UE、资源或流；沿用已确认的样本、单位、分母和同侪约束 |
+| 图文辅助分析 | 若回答需要且服务可用，在 loop 内完成视觉比对；结果标明辅助证据等级，不能替代精确统计 |
+| 证据校验与汇总 | 校验完整结果、数值、单位、范围、来源及统计一致性，生成目标级摘要与完整产物引用 |
+
+每项任务保存 task_id、goal_id、可选 hypothesis_id、purpose、tool_name/version、inputs、依赖、scope/cohort、期望获得的证据、预算、指纹、执行状态、结果引用及错误。非查询任务同样记账；描述性任务无需虚构可证伪假设。通用目标可以基于当前范围建立受控群体，不依赖特性分析预先产生 feature.cohorts；新群体必须由已执行关系或明确范围派生。
+
+LLM 选择候选行动并说明分析目的，程序校验能力、字段来源、权限、范围和预算后执行。结构化规则已能确定的步骤可直接执行，不必增加模型调用。计划合法性不等于业务结论成立；查询成功不等于假设成立；引用合法不等于因果关系成立。
+
+每轮用新增证据重新评估业务目标、假设、残余群体、冲突和缺口。已支持的假设可以因反证降级，未完成目标也可因补查完成升级；不只记录静态的循环前 goals。原因分析必须考虑当前证据支持的替代解释和关键反证，不能找到一个支持案例就提前闭环；无需穷举与本题无关的所有可能原因。具体 SPF 排查规则由版本化领域规则承载，通用调度器不继续累加特性专属分支。
+
+### 30.4 循环出口与冻结证据包
+
+出口检查发生在 loop 内，确认必要任务、解释所需的证据材料、矛盾及未解释群体均已处理或有明确阻碍，并检查 §19.4 停止条件。模型提出停止只是候选决定，必须结合逐目标完成标准、任务账本及实际证据核验。
+
+| 出口类别 | stop_reason | 对外含义 |
+| --- | --- | --- |
+| 目标完成 | GOALS_VERIFIED | 已达到本轮问题所需深度，不自动等于根因已确认 |
+| 资料或口径受限 | DATA_INSUFFICIENT / CRITERIA_REQUIRED / CLARIFICATION_REQUIRED | 已有部分事实，剩余必要判断有经核查的具体阻碍 |
+| 执行未完成 | BUDGET_EXHAUSTED / NO_PROGRESS / TECHNICAL_FAILURE / UNSUPPORTED_OPERATION | 存在未完成分析，不声称现有资料无法支持 |
+| 用户停止 | USER_STOPPED | 立即保留状态；只在已获授权且无需继续分析的范围内保存当前事实，不启动新的模型工作 |
+
+有多个阻碍时，保留每个目标/任务的原因列表；顶层主停止原因不能覆盖其他缺口或失败。空任务、重复查询、没有新想法和上下文截短不是“已获得全部信息”的依据。以新增有效证据、已证明缺口、冲突处理或目标/假设状态的实质变化衡量进展，重复检索同一版本材料不计新进展。
+
+出口生成不可变 `AnalysisEvidenceBundle`（目标 schema：`analysis-evidence.v1`）：
+
+| 内容 | 必需字段或含义 |
+| --- | --- |
+| 包身份 | bundle_id/schema_version、analysis_id/action_id、request_hash、graph_version、created_at、bundle_hash |
+| 范围及来源 | 数据指纹、输入清单与成功/失败文件、Scope/群体、字段映射/规则/质量版本、统计单位及口径 |
+| 问题与完成情况 | 原始及有效问题、AnalysisPlan 修订、goals/completion_criteria、最终目标状态和逐项目依据 |
+| 分析步骤 | step/task_id、目的、工具及参数引用、依赖、来源关系、输入输出产物、状态、可公开的分析依据 |
+| 观测与计算 | fact/claim_id、MetricSpec、完整结果及摘要的路径/哈希、范围/样本/覆盖/单位、来源行回查引用 |
+| 假设与冲突 | hypothesis_id、支持/反驳/未定状态及依据、残余群体、矛盾与影响、明确的未知项 |
+| 知识与案例 | 文档/规则/案例的版本、哈希及定位，引用片段或固定副本，适用性、相似点/差异和未验证项 |
+| 结束与复用 | stop_reason、各项阻碍、待执行任务、预算消耗、父证据包、复用产物及兼容性检查 |
+
+证据包冻结不是把所有行放进 JSON。完整结果继续保存在不可变产物中，包保存引用、哈希及目标级汇总；explain/report 可按目标分页读取包内已保存材料。需要额外聚合、跨表关联、字段查询、外部检索或视觉取证的操作均属于分析，必须在冻结前执行。图表可依据已有结果渲染，但新统计、推断或改变分组口径不能以“画图”为名放到 report 中。
+
+冻结前先校验引用并写入不可变包，再事务提交包引用、哈希和 phase；提交成功后才允许 explain 读取。中断重试依据动作和内容身份复用已提交包，未提交文件不算冻结成功；保存失败标记 STORAGE_FAILURE，不继续输出伪装成完整的证据包。冻结后不追加/替换内容，旧文档更新也不改变包内知识依据。
+
+### 30.5 explain：基于既有结果综合解释与结论
+
+输入只能是冻结证据包及其中列出的产物，不具有业务数据库查询、新知识检索或补查任务提交权限。综合输出 `ExplanationResult` 至少包含 explanation_id、bundle_id/hash、direct_answer、conclusions、unresolved_items、limitations 和 output_status。
+
+每项 conclusion 记录 conclusion_id、goal_id、text、level、fact_refs、analysis_step_refs、knowledge_refs、支持与反驳依据、适用范围及限制。允许在已计算事实和可信规则上归纳、比较与组织推断，不要求逐字复述工具结果；新增综合结论必须能展开为包内已有事实与规则的明确关系，不引入新的观测事实、关键前提、门限、统计量或确定性归因。
+
+例如，包内已有各未满足条件的覆盖比例、重叠与剩余样本，解释可综合回答“主要限制条件是什么”；覆盖不同无法公平排序时明确限制，不能仅因某组数字最大就确认主因。相似案例仍只提供参考，不升级为当前根因。OBSERVATION/HYPOTHESIS/CONFIRMED 沿用 §5.2，每条陈述分别定级。
+
+解释发现遗漏、未解决冲突或无法支持的推断时，限制或删除相应陈述，记录输出侧问题及影响，不改写冻结包、目标状态或停止原因，不重新取证、不返回 loop。即使包中记录 GOALS_VERIFIED，若输出检查发现关键材料不足，也必须在 output_status 标记 PARTIAL/VALIDATION_FAILED 等并披露差异，不能对用户发布无条件完整答案。
+
+结构、数值、引用、范围及结论依据检查失败时，最多两次有界修复，使用同一证据包且计入剩余预算。仍失败或模型不可用时生成确定性部分解释，保留已验证事实、缺口和停止原因；不为了完成文本而扩大推断。`suggested_followup_queries` 只说明补充资料后的验证或新的问题方向，不能将本轮仍可执行的必要任务转交用户而声称完成。
+
+### 30.6 report：逐步关联分析、数据与结论
+
+report 输入相同冻结包与通过校验的 ExplanationResult，输出报告身份、版本、bundle/explanation 哈希、正文、图表/表格引用和关联索引。只细化表达与组织证据，不重新判定原因、不提升结论等级、不补查数据。模型不可用时采用确定性模板；不因缺少润色而丢失事实报告。
+
+报告正文包括：直接答案与完成状态；输入文件/数据范围与质量口径；各项目标及分析方法；每步有效分析的发现、数据与规则引用；支持和排除的候选解释；未解释群体、冲突与限制；停止原因和需要补充的信息。记录失败或跳过步骤对结论的影响；重复请求、结构修复等运行细节放到附录/日志，不伪造为新的有效分析。提供可核查的分析依据，不展示模型内部思考文本。
+
+关联索引至少支持 `conclusion_id → goal_id → analysis_step_ids → fact/claim_ids → artifact_id/hash → record_id/source_file/file_row_id`，以及相应 document/rule 引用。聚合结论需保留过滤、公式、分子分母及完整结果；无单行归属时引用完整关系和来源清单，不伪造行号。排除结果、未定项与复用父分析证据同样可回查，派生证据可通过父引用逐级定位。
+
+摘要与详细报告使用同一组 conclusion_id、证据包和统计值；图表与表格注明单位、样本、降采样/预览范围。校验发现无来源数字、缺失关联或结论不一致时，在冻结输入上修复排版/引用或删除不支持内容并标记输出降级；不得静默改成另一份分析。UI 继续简短展示结论，详细报告及证据默认折叠，不新增普通用户的逐步确认负担。
+
+### 30.7 新问题与连续追问
+
+每次用户追问创建新的 analysis_id/action_id，携带原始问题、追加问题、用户纠正、parent_analysis_id/bundle_ref、明确的群体/事件，以及经校验的历史事实、假设状态、缺口和查询账本，再走 `plan → agent loop → explain → report`。有效问题由本轮目标决定，不机械重跑所有旧问题；用户纠正应记录 supersedes 关系，不能把被纠正的假设继续当作前提。
+
+历史文字结论只是可查看的解释，复用依据必须是结构化事实与证据。复用前检查数据指纹、范围/群体、质量和统计口径、字段/规则版本及产物哈希；范围收窄需要重算比例或其他统计时，在新 loop 中执行，不能直接沿用旧数值。版本或规则变化使受影响结论重新评估，保留原分析不变；不同数据集分别分析，不合并成一个证据总体。指代有多个有效候选或范围确实冲突时才澄清，不增加例行确认。
+
+同一动作的重试与新追问分开：重试复用原请求、图版本、累计预算和阶段；冻结后重试 explain/report 不能触发 loop。新追问使用独立预算并显式链接父分析，不冒充原动作恢复，也不自动靠生成新动作绕过预算。已发布报告保持不可变。
+
+### 30.8 实现迁移、持久化与预算
+
+复用现有数据底座、QueryPlan 编译/执行器、完整证据及摘要、特性和状态分析、来源链、任务指纹、查询缓存、累计预算与 ActionProgress。将 retrieve/route/requirements/coverage/verify/goals 等职责整合为 loop 的工具或内部检查；plan 负责初始目标而非锁死全部查询，特性规则不再独占自动追加任务能力。保留小步检查点，不把能力合并成不可恢复的单体函数。
+
+将旧 completion_gate 的必要分析检查前移至 loop 出口；移除解释消费/新增假设回查机制，改为冻结包后的输出校验。所有取证包括视觉比对在 loop 内完成，原 report→explain 顺序改为 explain→report。新图、状态和提示词独立版本化；旧最终结果只读兼容，未完成旧动作只能用兼容旧图恢复或显式另建新分析，不能静默转入新图。
+
+总预算从 plan 入口开始计量，覆盖计划、工具调度、查询、检索、模型重试、解释和报告生成；按阶段记录模型/工具/查询次数及耗时，不能把追加查询上限称为全链路 SQL 总数。为解释与报告预留可配置预算，loop 不得消耗预留部分；各阶段共同受总预算约束，恢复不重置。无模型预算时 explain/report 使用确定性结果整理，不继续调用模型；保存已有证据和最小状态报告不开展新的业务分析。USER_STOPPED 后不自动启动解释模型。
+
+采用 §28.1 的事务状态及动作锁，持久化图版本、计划修订、任务账本、预算、冻结引用、解释及报告阶段提交状态。读包核验哈希；产物缺失/损坏时隔离受影响内容并明确输出不完整，不以新查询冒充原证据修复。详细报告生成失败与分析证据已完成分别记录，允许仅重试输出阶段。
+
+### 30.9 迁移验收与效果评估
+
+以下为待实施验收要求，不代表本次文档修订已通过代码测试或现场验收。
+
+| 场景 | 验收要求 |
+| --- | --- |
+| 单向拓扑和权限 | 顶层为 plan、agent loop、explain、report 四个业务阶段；explain/report 无返回 loop 的边，无新查询/检索工具权限 |
+| 简单统计与复杂原因 | 均值问题适度完成；特性、比较、时序、复合问题可动态组合工具，不受已有 feature 群体或 CONDITION_COUNT 限制 |
+| 动态完成状态 | 补充证据能完成原缺口，反证能降级已有判断；空队列、空模型任务或字段齐全不直接等于问题闭环 |
+| 候选原因与残余群体 | 支持证据、关键反证及未解释样本均有去向；案例相似不自动确认根因，必要条件不误当充分条件 |
+| 资料受限与执行失败 | 缺数据/规则/指代、预算、无进展、技术故障分别呈现，保留多原因及已有结果，不伪称信息穷尽 |
+| 冻结及恢复 | 在包写入、提交、解释、报告各阶段中断后可恢复；不换包、不重跑完成查询、不清零预算，损坏可检出 |
+| 解释边界 | 可综合已核验结果；新数字、新关键假设或不支持的因果陈述被拒绝；输出修复不触发 loop |
+| 大结果与上下文 | 全量证据保留，允许按目标读取冻结材料；预览截短不误报缺失，报告渲染不暗中新增统计 |
+| 报告溯源 | 每项结论可关联步骤、数据、规则及来源；排除项、未定项和父分析复用均可查；摘要与正文数值一致 |
+| 追问与纠正 | 原问题和新目标均保留，群体明确、旧证据按兼容性复用，纠正不被旧结论覆盖；不同数据集不合并 |
+| 降级输出 | 未配置模型、预算耗尽或输出校验失败仍保留确定性事实/部分报告；不把输出失败等同于取证失败 |
+| 业务回归 | 既有流控、质量、日期、单位、分母、会话、输入去重及部分加载规则不因编排迁移改变 |
+
+采用同一组脱敏真实问题和可复算样例对比新旧架构，涵盖同义改写、不同问题类型、多轮追问、缺测与冲突；记录目标完成度、专家核对正确性、无依据结论、证据关联完整率、重复查询、耗时与模型成本。同一配置下重复运行检查结果一致性，判断同义问题的目标与统计口径是否一致，不要求工具调用顺序完全相同。先建立旧版基线和验收阈值再评估新实现，未验证前不宣称可靠性必然提升。

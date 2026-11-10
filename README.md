@@ -33,6 +33,8 @@ LangGraph 执行检索 → 计划 → 受控查询 → 证据验证 → 回答�
 
 开发顺序和验收缺口见 [开发路线](docs/DEVELOPMENT_ROADMAP.md)。设计文档和查询样式属于产品需求资料，其中命令或示例不会被自动执行。`.env`、原始数据、数据库和本地依赖不提交 Git。
 
+完整的当前设计与实现方案见 [详细设计说明书](5g_srs_diagnostic_agent_design_spec.md)，其中第 8 章区分现有能力与待实施工作。讨论、方案演进及验证记录见 [设计变更记录](docs/DESIGN_CHANGELOG.md)。
+
 相对路径从仓库根目录解析。详见 [样例验证](docs/SAMPLE_VALIDATION.md) 与 [字段说明](knowledge_assets/field_mappings/nr_srs_field_mapping.md)。新清洗版本 m1.3 增加可查询补充标量字段；m1.2 历史数据仍可恢复，旧数据集不会自动迁移。
 
 后续开发可使用 `generate` 命令生成正常或混合异常数据，正常四流增益严格递减。生成与范围统计使用方式见 [随机测试数据](docs/SYNTHETIC_DATA.md)。
