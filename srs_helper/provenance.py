@@ -108,10 +108,11 @@ def feature_cohorts(feature, source, folder):
 
 def validate_parent(parent, meta, scope, cohort_name):
     from .evidence import verify_artifact
+    from .question_scope import normalize_scope, scope_dict
     context=parent.get('analysis_context')
     if not context or (context['dataset_id'],context['dataset_fingerprint']) != (meta['dataset_id'],meta['dataset_fingerprint']):
         raise ValueError('Parent dataset mismatch or legacy context')
-    if (context['scope']!=json.loads(canonical(scope.__dict__)) or context['etl_rule_version']!=meta['rule_version']
+    if (scope_dict(normalize_scope(context['scope']))!=scope_dict(scope) or context['etl_rule_version']!=meta['rule_version']
             or context['field_mapping_hash']!=identity(meta['contract'])):
         raise ValueError('Parent scope or version mismatch; start a new analysis')
     if context.get('quality_policy')!='EXCLUDE_ABNORMAL_RECORD' or context.get('analysis_unit')!='record' or context.get('cross_session_merge') is not False:

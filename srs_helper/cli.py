@@ -63,7 +63,17 @@ def main():
             sid = args.session_id or engine.store.create(args.dataset_dir,args.question[:80])
             if Path(engine.store.get(sid)["dataset_dir"]).resolve()!=args.dataset_dir.resolve():
                 raise ValueError("Session belongs to a different dataset directory")
-            result = engine.run(sid,args.question,Scope(logic_cell_id=args.cell,crnti=args.crnti,resource_id=args.resource,start=args.start,end=args.end),feature_path=args.feature)
+            from .question_scope import resolve_question, confirm_request, normalize_scope
+            initial_scope=Scope(logic_cell_id=args.cell,crnti=args.crnti,resource_id=args.resource,start=args.start,end=args.end)
+            candidate=resolve_question(args.question,initial_scope,args.dataset_dir,model=engine.model)
+            if candidate['issues']:
+                raise ValueError('请澄清查询范围：'+'；'.join(candidate['issues']))
+            resolved=normalize_scope(candidate['scope'])
+            request=confirm_request(args.dataset_dir,args.question,resolved,
+                [m['canonical_field'] for m in candidate['metrics']],candidate['trend'],
+                single_subject=candidate.get('single_subject_statement',False),
+                execution_mode='AUTO_FROM_QUESTION',intent_spec=candidate.get('intent_spec'))
+            result = engine.run(sid,args.question,resolved,feature_path=args.feature,confirmed_request=request)
             result = {key:result[key] for key in ["session_id","action_id","answer","notices","retrieval_mode","steps"]}
         print(json.dumps(result,ensure_ascii=False,indent=2,default=str))
     elif args.command == "generate":

@@ -32,7 +32,9 @@ from .sessions import SessionStore, dumps
 from .progress import ActionProgress, StorageFailure
 from .sql_executor import execute_sql
 from .charts import time_series_artifact, metric_time_series
-from .question_scope import validate_request
+from .question_scope import validate_request, scope_dict
+from .data_audit import audit_data_coverage
+from .task_review import review_tasks, SYSTEM as TASK_REVIEW_SYSTEM
 from .provenance import analysis_context, validate_parent, bind_cohort, identity, event_population
 from .prompts import EXPLAIN_SYSTEM, PLAN_SYSTEM, VERIFY_SYSTEM, PROMPT_VERSION, relevant_columns
 from .verification_loop import VerificationLoop, TaskProposal, loop_report, predicate_label
@@ -67,6 +69,7 @@ class DiagnosticState(TypedDict, total=False):
     evidence_bundle: dict
     analysis_steps: list[str]
     analysis_plan: dict
+    data_audit: dict
 
 
 def restore_scope(data):
@@ -534,15 +537,29 @@ class DiagnosticEngine:
                     t=a["statistics"]
                     answer+=f"\n{a['field']}：完整范围共 {t['points']} 个观测时点，{t['valid_points']} 个时点有唯一有效值；最小/最大值 {t['minimum']} / {t['maximum']}。时间覆盖 {t['start']} 至 {t['end']}。使用原始数值，不推断距离或持续变化；分小区与会话查看折线图。"
                     for group in a.get('group_statistics',[])[:20]:
-                        answer+=f"\n小区 {group['logicCellId']} / 会话 {group['ue_uid']}：有效时点 {group['valid_points']}，首末有效值 {group['first_value']} → {group['last_value']}，极值 {group['minimum']} / {group['maximum']}。"
+                        source=(f" / 资源 {group.get('resourceId')} / RB {group.get('freqRbStart')}+{group.get('freqRbNum')} / 来源 {group.get('source_file')}" if a.get('observation_version') else '')
+                        change=('顺序存在断点，未判定整段首末变化' if group.get('order_breaks',0)>0 else
+                                '没有有效数值，不能判断变化' if not group['valid_points'] else
+                                f"首末有效值 {group['first_value']} → {group['last_value']}")
+                        answer+=f"\n小区 {group['logicCellId']} / 会话 {group['ue_uid']}{source}：有效时点 {group['valid_points']}，{change}，极值 {group['minimum']} / {group['maximum']}。"
                     if len(a.get('group_statistics',[]))>20:
-                        answer+='\n正文仅列出前20个会话，完整分组统计在证据画布查看；不代表其他会话不存在。'
+                        answer+='\n正文仅列出前20组观测序列，完整分组统计在证据画布查看；不代表其他对象不存在。'
+                    if a.get('observation_version'):
+                        answer+='\n同秒内不同无线观测分别保留；观测序列不表示毫秒间隔，小区间未确认同步时分别展示。'
             general_report=summary_report(ephemeral['artifacts'])
             if general_report: answer+='\n\n'+general_report
             restrictions=limitations_for(state.get('plan'),ephemeral['artifacts'])
             if restrictions: answer+='\n\n分析限制：\n'+'\n'.join('- '+v for v in restrictions)
             if (confirmed_request or {}).get('subject_assertion'):
-                answer+='\n依据用户本次说明：当前范围内的 CRNTI 属于同一用户。保留各小区及接入会话分段，段间不连线；这不是数据自动证明的身份。'
+                answer+='\n依据用户本次说明：当前选定对象属于同一用户。保留各小区及接入会话来源，段间不连线；这不是数据自动证明的身份。'
+            audit=ephemeral.get('data_audit',{})
+            if audit:
+                answer+='\n\n数据覆盖审核：'+str(audit.get('status','UNKNOWN'))+'。'
+                for limitation in audit.get('limitations',[]):
+                    answer+='\n- '+(limitation if isinstance(limitation,str) else dumps(limitation))
+            for task in ephemeral.get('task_review',{}).get('tasks',[]):
+                if task['status']!='SUPPORTED':
+                    answer+='\n待完成目标：'+task['objective']+'。'+task['reason']
             if not s["flow_valid_count"]:
                 answer += " 当前范围无数据，不能据此确认或排除根因。"
             missing_gains = gains_missing(s)
@@ -568,7 +585,8 @@ class DiagnosticEngine:
             # A final generator runs once; subsequent verification ends in deterministic composition.
             if journal.get('explanation_complete'):
                 ephemeral.update(claims=journal.get('claims',[]),hypotheses=journal.get('hypotheses',[]),
-                    responsibility_evidence=journal.get('responsibility_evidence',[]),visual=journal.get('visual',{}))
+                    responsibility_evidence=journal.get('responsibility_evidence',[]),visual=journal.get('visual',{}),
+                    conclusion_audit=journal.get('conclusion_audit',{}))
                 ephemeral['model_status']['explain']=journal.get('explain_status','REUSED')
                 return {'answer':answer,'notices':notices,'steps':state['steps']+['explain']}
             # Free-form model text is never promoted to measured fact. Numeric claims must bind full artifacts.
@@ -596,6 +614,9 @@ class DiagnosticEngine:
                             raise ExplanationError('NEW_HYPOTHESIS_AFTER_FREEZE','hypotheses')
                         ephemeral['model_status']['explain']='SUCCEEDED'
                         ephemeral["claims"] = claims
+                        ephemeral['conclusion_audit']={'status':'PASSED','attempts':attempt+1,
+                            'checks':['artifact_integrity','numeric_values','units','references','frozen_hypotheses'],
+                            'scope':'structured_claims_only','data_tools_called':False}
                         break
                     except ServiceError as exc:
                         ephemeral['model_status']['explain']='FAILED:'+exc.code
@@ -610,6 +631,10 @@ class DiagnosticEngine:
                         if attempt==2:
                             notices.append("模型解释未通过证据校验（"+exc.code+"，"+exc.location+"），只发布确定性事实表。")
             ephemeral["responsibility_evidence"] = []
+            if not legacy_graph and 'conclusion_audit' not in ephemeral:
+                ephemeral['conclusion_audit']={'status':'FACTS_ONLY','reason':ephemeral['model_status']['explain'],
+                    'errors':[e for e in ephemeral['validation_errors'] if e.get('stage')=='explanation'],
+                    'scope':'structured_claims_only','data_tools_called':False}
             for doc in ephemeral['documents']:
                 catalog = doc['metadata'].get('field_catalog',{}).get('fields',{})
                 for requirement in state['requirements']:
@@ -623,7 +648,8 @@ class DiagnosticEngine:
             ephemeral["visual"] = ephemeral.get("visual", {}) if not legacy_graph else ({"status":"NOT_RUN","reason":"验证未完成，暂停可选视觉解释。"} if unfinished_verification else {"status":"NOT_RUN","reason":"当前问题没有可用的增益图比对需求或样本。"} if missing_gains or not any(r["field"]=="instBfSinrGain" for r in state["requirements"])
                                   else compare_visual(self.vision,s,ephemeral["documents"],self.index,folder))
             save_progress(explanation_complete=True,claims=ephemeral.get('claims',[]),hypotheses=hypotheses,
-                explain_status=ephemeral['model_status']['explain'],responsibility_evidence=ephemeral['responsibility_evidence'],visual=ephemeral['visual'])
+                explain_status=ephemeral['model_status']['explain'],responsibility_evidence=ephemeral['responsibility_evidence'],visual=ephemeral['visual'],
+                conclusion_audit=ephemeral.get('conclusion_audit',{}))
             feature = ephemeral.get('feature') or {}
             partial = any(g['status']!='VERIFIED' for g in state['goals']) or feature.get('status')=='INCONSISTENT'
             return {"answer":answer,"status":"PARTIAL_FACTS_READY" if partial else "FACTS_READY", "notices":notices,"steps":state["steps"]+["explain"]}
@@ -666,6 +692,32 @@ class DiagnosticEngine:
         def apply_stage(state, name, fn):
             state.update(timed_node(name, fn)(state))
 
+        def data_review(state, repair=False):
+            """Audit the actual requested population before the immutable handoff."""
+            if not confirmed_request:
+                return {'data_audit':{'status':'NOT_REQUIRED'},'steps':state['steps']+['data_review' if repair else 'data_preflight']}
+            try:
+                audit=audit_data_coverage(session['dataset_dir'],scope,confirmed_request,
+                                         ephemeral['artifacts'],seconds=max(.01,min(30,remaining())))
+                if repair and audit['tasks'] and not journal.get('data_repair_attempted') and remaining()>0:
+                    save_progress(data_repair_attempted=True)
+                    for task in audit['tasks']:
+                        if remaining()<=0: break
+                        if task['kind']=='METRIC_TIME_SERIES':
+                            artifact=metric_time_series(session['dataset_dir'],scope,folder,task['field'])
+                            artifact['origin']='DATA_AUDIT_REPAIR'
+                            ephemeral['artifacts'].append(artifact)
+                    save_progress(artifacts=ephemeral['artifacts'])
+                    audit=audit_data_coverage(session['dataset_dir'],scope,confirmed_request,
+                                             ephemeral['artifacts'],seconds=max(.01,min(30,remaining())))
+            except Exception as exc:
+                if isinstance(exc,StorageFailure): raise
+                audit={'status':'FAILED','tasks':[],'per_cell':[],
+                       'limitations':[{'code':type(exc).__name__,'message':'数据覆盖审核未完成，不能宣称已覆盖全部对象。'}]}
+            ephemeral['data_audit']=audit
+            save_progress(data_audit=audit)
+            return {'data_audit':audit,'steps':state['steps']+['data_review' if repair else 'data_preflight']}
+
         def initial_plan(state):
             if journal.get('evidence_bundle'):
                 frozen = read_bundle(journal['evidence_bundle'])
@@ -676,6 +728,8 @@ class DiagnosticEngine:
                 'parent_question':parent.get('question') if parent else None,
                 'context':context, 'scope':json.loads(dumps(scope.__dict__)),
                 'metrics':(confirmed_request or {}).get('metrics',[]),
+                'intent_spec':(confirmed_request or {}).get('intent_spec'),
+                'intent_version':((confirmed_request or {}).get('intent_spec') or {}).get('version'),
                 'completion_criteria':'逐目标核验实际证据、业务规则、覆盖与残余缺口；空队列不代表根因确认'}}
 
         def agent_loop(state):
@@ -692,11 +746,14 @@ class DiagnosticEngine:
                              ('plan_queries',plan_node),('execute',execute),('feature',feature_node),
                              ('states',states_node),('coverage',coverage_node),('verify',verify),('goals',goals_node)]:
                 apply_stage(state,name,fn)
+            apply_stage(state,'data_preflight',data_review)
             def analysis_remaining(): return remaining()
             if journal.get('tool_documents'):
                 ephemeral['documents']=journal['tool_documents']
                 state['refs']=journal['tool_refs']
+            tools_available=False
             if self.model.config.configured and sql_override is None and plan_override is None and not (state['route']=='FEATURE' and all(g['status']=='VERIFIED' for g in state['goals']) and not any(w in question for w in ('原因','为什么','条件','排查','验证','假设'))) and (not state['requirements'] or any(r['status']=='COVERED' for r in state['requirements'])):
+                tools_available=True
                 def propose(payload):
                     return budgeted_model([SystemMessage(content=TOOL_SYSTEM+FOUR_STREAM_POLICY),
                                            HumanMessage(content=dumps(payload))],'tools')
@@ -719,13 +776,15 @@ class DiagnosticEngine:
                             ephemeral['documents'].append(doc)
                             state['refs'].append({'path':doc['path'],'version':doc['version'],'kind':doc['kind'],
                                                   'title':doc.get('title',doc['path']),'excerpt':doc.get('body','')[:8000]})
-                    return [d['path'] for d in docs]
+                    return [{'path':d['path'],'version':d['version'],'excerpt':d.get('body','')[:4000]} for d in docs]
                 def persist_tools(ledger):
                     save_progress(tool_ledger=ledger,artifacts=ephemeral['artifacts'],requirements=state['requirements'],
                                   tool_documents=ephemeral['documents'],tool_refs=state['refs'])
                 ledger=run_tools(propose=propose,
                     payload=lambda:{'question':question,'context':context,'columns':columns,
                                     'goals':state['goals'],'evidence':model_evidence(ephemeral['artifacts']),
+                                    'intent_spec':(confirmed_request or {}).get('intent_spec'),
+                                    'data_audit':ephemeral.get('data_audit'),
                                     'knowledge':state['refs'],'parent_question':parent.get('question') if parent else None},
                     query=query_tool,search=search_tool,save=persist_tools,
                     restored=journal.get('tool_ledger'),remaining=analysis_remaining)
@@ -743,13 +802,83 @@ class DiagnosticEngine:
             ephemeral['visual']={'status':'NOT_RUN','reason':'无当前问题所需的视觉取证或预算'}
             if analysis_remaining()>0 and not gains_missing(ephemeral['summary']) and any(r['field']=='instBfSinrGain' for r in state['requirements']):
                 ephemeral['visual']=compare_visual(self.vision,ephemeral['summary'],ephemeral['documents'],self.index,folder)
+            apply_stage(state,'data_review',lambda s:data_review(s,repair=True))
+            def task_review_node(s):
+                def propose_review(payload):
+                    return budgeted_model([SystemMessage(content=TASK_REVIEW_SYSTEM),HumanMessage(content=dumps({
+                        **payload,'question':question,'data_audit':ephemeral.get('data_audit',{}),
+                        'evidence':model_evidence(ephemeral['artifacts']),
+                        'business_goals':s['goals']}))],'task_review')
+                review=review_tasks((confirmed_request or {}).get('intent_spec'),ephemeral['artifacts'],
+                    ephemeral.get('data_audit',{}),propose_review if self.model.config.configured and remaining()>0 else None)
+                if review['status']=='LIMITED' and self.model.config.configured and remaining()<=0:
+                    review['error']='BUDGET_EXHAUSTED'
+                ephemeral['task_review']=review
+                save_progress(task_review=review)
+                return {'steps':s['steps']+['task_review']}
+            apply_stage(state,'task_review',task_review_node)
+            # One bounded return to data tools on a semantic coverage gap, before freeze.
+            previous_ledger=ephemeral.get('tool_ledger',[])
+            if (ephemeral.get('task_review',{}).get('status')=='LIMITED' and tools_available
+                    and not ephemeral.get('task_review',{}).get('error')
+                    and ephemeral.get('data_audit',{}).get('status')=='PASS'
+                    and remaining()>0 and not journal.get('task_repair_attempted')
+                    and previous_ledger and previous_ledger[-1]['status']=='FINISHED'
+                    and len(previous_ledger)<6):
+                reopened=[*previous_ledger,{'status':'REOPENED','purpose':'任务审核发现未覆盖目标，冻结前有限补查'}]
+                save_progress(task_repair_attempted=True,tool_ledger=reopened)
+                ephemeral['tool_ledger']=run_tools(propose=propose,
+                    payload=lambda:{'question':question,'context':context,'columns':columns,
+                        'goals':state['goals'],'intent_spec':(confirmed_request or {}).get('intent_spec'),
+                        'task_review':ephemeral['task_review'],'evidence':model_evidence(ephemeral['artifacts']),
+                        'knowledge':state['refs']},query=query_tool,search=search_tool,save=persist_tools,
+                    restored=reopened,remaining=analysis_remaining)
+                ephemeral['loop'].goals=state['goals']
+                apply_stage(state,'data_review_after_tasks',lambda s:data_review(s,repair=True))
+                apply_stage(state,'task_review_after_tools',task_review_node)
+                if ephemeral['tool_ledger'][-1]['status']=='FAILED':
+                    failure=ephemeral['tool_ledger'][-1].get('error')
+                    ephemeral['loop'].stop('BUDGET_EXHAUSTED' if failure=='BUDGET_EXHAUSTED' else 'TECHNICAL_FAILURE',
+                        '任务审核后的补查未完成，保留已有证据。')
+                elif ephemeral['tool_ledger'][-1]['status']=='NO_PROGRESS':
+                    ephemeral['loop'].stop('NO_PROGRESS','任务补查重复且没有新增证据，保留已有事实。')
+                elif (ephemeral['tool_ledger'][-1]['status']=='FINISHED'
+                      and ephemeral.get('task_review',{}).get('status')=='PASS'
+                      and ephemeral.get('data_audit',{}).get('status')=='PASS'
+                      and ephemeral['loop'].state.stop_reason=='NO_PROGRESS'):
+                    # Recompute only a resolved no-progress stop; never erase failures.
+                    ephemeral['loop'].state.stop_reason=None
             state.setdefault('answer','')
             apply_stage(state,'finalize_analysis',finalize)
+            audit=ephemeral.get('data_audit',{})
+            if audit.get('status') not in {None,'PASS','NOT_REQUIRED'}:
+                state['goals'].append({'id':'data_coverage','status':'INSUFFICIENT',
+                    'reason':audit['status'],'evidence':audit.get('evidence_ids',[])})
+                # A technical interruption keeps its reason even if data also has gaps.
+                if state['loop_state']['stop_reason'] not in {'TECHNICAL_FAILURE','BUDGET_EXHAUSTED','USER_STOPPED'}:
+                    reason={'LIMITED':'DATA_INSUFFICIENT','FAILED':'TECHNICAL_FAILURE','NEEDS_DATA':'NO_PROGRESS'}[audit['status']]
+                    ephemeral['loop'].stop(reason,'数据覆盖审核未完全通过；逐小区原因见审核结果。')
+                    state['loop_state']=ephemeral['loop'].state.model_dump(mode='json')
+                state['status']='PARTIAL_FACTS_READY'
+            review=ephemeral.get('task_review',{})
+            if review.get('status')=='LIMITED':
+                state['goals'].extend({'id':t['task_id'],'status':'INSUFFICIENT','reason':t['reason'],
+                    'evidence':t['evidence_ids']} for t in review['tasks'] if t['status']!='SUPPORTED')
+                stop=state['loop_state']['stop_reason']
+                if review.get('error') and stop not in {'TECHNICAL_FAILURE','BUDGET_EXHAUSTED','USER_STOPPED'}:
+                    ephemeral['loop'].stop('BUDGET_EXHAUSTED' if review['error']=='BUDGET_EXHAUSTED' else 'TECHNICAL_FAILURE',
+                        '语义任务审核未完成：'+review['error'])
+                    state['loop_state']=ephemeral['loop'].state.model_dump(mode='json')
+                elif stop=='GOALS_VERIFIED':
+                    ephemeral['loop'].stop('NO_PROGRESS',
+                        '仍有语义任务未完成覆盖审核，保留已有事实。')
+                    state['loop_state']=ephemeral['loop'].state.model_dump(mode='json')
+                state['status']='PARTIAL_FACTS_READY'
             ephemeral['frozen_hypotheses']=ephemeral.get('hypotheses',[])
             state['analysis_steps']=list(state['steps'])
             state['steps']=['plan','agent_loop']
             keys=['summary','artifacts','feature','session_states','documents','selected_feature','peers',
-                  'case_assessments','hypotheses','frozen_hypotheses','visual','tool_ledger']
+                  'case_assessments','hypotheses','frozen_hypotheses','visual','tool_ledger','data_audit','task_review']
             ref=freeze_bundle(folder,{'graph_version':GRAPH_VERSION,'analysis_id':action_id,'context':context,
                 'question':question,'parent_bundle':parent.get('evidence_bundle') if parent else None,
                 'parent_question':parent.get('question') if parent else None,
@@ -765,6 +894,7 @@ class DiagnosticEngine:
                 if saved['bundle'] != state['evidence_bundle']:
                     raise ValueError('Explanation belongs to a different bundle')
                 ephemeral.update(claims=saved['claims'],hypotheses=saved['hypotheses'],
+                                 conclusion_audit=saved.get('conclusion_audit',{}),
                                  explanation_ref=journal['explanation_ref'],
                                  responsibility_evidence=journal.get('responsibility_evidence',[]))
                 ephemeral['model_status']['explain']=saved['model_status']
@@ -775,6 +905,7 @@ class DiagnosticEngine:
             result['status']=frozen['state']['status']
             explanation_payload={'schema_version':'explanation.v1','bundle':state['evidence_bundle'],
                 'claims':ephemeral.get('claims',[]),'hypotheses':ephemeral['hypotheses'],
+                'conclusion_audit':ephemeral.get('conclusion_audit',{}),
                 'model_status':ephemeral['model_status']['explain'],'limitations':state['notices']}
             ephemeral['explanation_ref']=publish_json(folder,explanation_payload,'explanation')
             save_progress(phase='REPORT',explanation_ref=ephemeral['explanation_ref'])
@@ -785,6 +916,9 @@ class DiagnosticEngine:
             result=report_node(state)
             result['answer']+='\n\n'+loop_report(frozen['state']['loop_state'])
             index=report_index(frozen,ephemeral.get('claims',[]))
+            index['data_audit']=ephemeral.get('data_audit',{})
+            index['conclusion_audit']=ephemeral.get('conclusion_audit',{})
+            index['task_review']=ephemeral.get('task_review',{})
             ephemeral['report_index']=index
             result['answer']+='\n\n分析证据：\n'+'\n'.join(
                 '- '+a['artifact_id']+'：'+str(a.get('operator',''))+'（完整数据与来源见证据详情）'
@@ -849,6 +983,8 @@ class DiagnosticEngine:
                           analysis_steps=final.get('analysis_steps',[]),tool_ledger=ephemeral.get('tool_ledger',[]),
                           explanation_ref=ephemeral.get('explanation_ref'),report_ref=ephemeral.get('report_ref'),
                           report_index=ephemeral.get('report_index',{}),analysis_plan=final.get('analysis_plan',{}))
+            result.update(data_audit=ephemeral.get('data_audit',{}),conclusion_audit=ephemeral.get('conclusion_audit',{}))
+            result['task_review']=ephemeral.get('task_review',{})
         for artifact in result["artifacts"]:
             if confirmed_request: artifact["confirmed_request_hash"]=confirmed_request["request_hash"]
         self.store.finish(sid,action_id,result)

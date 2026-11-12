@@ -1,7 +1,7 @@
 from srs_helper.intents import temporal_intent
 from srs_helper.progress import StorageFailure
 from srs_helper.result_summary import read_summary
-from srs_helper.chart_preview import chart_objects, time_coverage
+from srs_helper.chart_preview import chart_objects, time_coverage, joint_time_coverage
 """Run with: python -m streamlit run app.py"""
 import json
 import re
@@ -24,9 +24,9 @@ from srs_helper.pipeline import build_dataset
 from srs_helper.provenance import record_trace, evidence_contains_record
 from srs_helper.queries import Scope
 from srs_helper.sessions import dumps
-from srs_helper.question_scope import parse_question, confirm_request, scope_dict, identity as request_identity, mapping as question_mapping, query_logic
+from srs_helper.question_scope import parse_question, resolve_question, confirm_request, scope_dict, identity as request_identity, mapping as question_mapping, query_logic
 from srs_helper.visual import export_chart
-from srs_helper.canvas import OPERATORS, describe_artifact, expression_text, feature_figures, observation_figure
+from srs_helper.canvas import OPERATORS, describe_artifact, expression_text, feature_figures, observation_figure, metric_figures
 
 st.set_page_config(page_title="SRS 诊断工作台",layout="wide")
 st.title("5G NR SRS 诊断工作台")
@@ -185,15 +185,17 @@ with left:
     restored = last.get("scope",{}) if last else {}
     scope_valid = True
     try:
-        cell = st.text_input("logicCellId（空为全部）",value=str(restored.get("logic_cell_id") or "") if restored.get("logic_cell_id")!=0 else "0",key=sid+"cell")
+        cell = st.text_input("logicCellId（逗号分隔多个，空为全部）",value=','.join(map(str,restored['logic_cell_ids'])) if restored.get('logic_cell_ids') else str(restored.get("logic_cell_id") or "") if restored.get("logic_cell_id")!=0 else "0",key=sid+"cell")
         crnti = st.text_input("CRNTI（空为全部）",value=str(restored.get("crnti") or ""),key=sid+"crnti")
         ue = st.text_input("ue_uid（空为全部）",value=restored.get("ue_uid") or "",key=sid+"ue")
         resource = st.text_input("resourceId（空为全部）",value="" if restored.get("resource_id") is None else str(restored["resource_id"]),key=sid+"resource")
         phy = st.text_input("phyCellInst（辅助筛选）",value="" if restored.get("phy_cell_inst") is None else str(restored["phy_cell_inst"]),key=sid+"phy")
         start = st.text_input("开始时间（含日期，包含）",value=restored.get("start") or "",key=sid+"start")
         end = st.text_input("结束时间（含日期，不包含）",value=restored.get("end") or "",key=sid+"end")
-        scope = Scope(int(cell) if cell else None,ue or None,int(crnti) if crnti else None,int(resource) if resource else None,
-                      datetime.fromisoformat(start) if start else None,datetime.fromisoformat(end) if end else None,int(phy) if phy else None)
+        cell_ids=[int(v.strip()) for v in cell.replace('，',',').split(',') if v.strip()]
+        scope = Scope(cell_ids[0] if len(cell_ids)==1 else None,ue or None,int(crnti) if crnti else None,int(resource) if resource else None,
+                      datetime.fromisoformat(start) if start else None,datetime.fromisoformat(end) if end else None,int(phy) if phy else None,
+                      logic_cell_ids=tuple(cell_ids) if len(cell_ids)>1 else None)
         scope.where()
     except ValueError:
         st.error("筛选值无效；时间示例：2026-10-22T00:00:00")
@@ -250,24 +252,35 @@ def run_question(question, plan_override=None,sql_override=None,peer_comparison=
 with middle:
     st.subheader("诊断与追问")
     question = st.text_area("问题描述",value="比较各流增益，查看异常比例与缺测情况。",key='question_text_'+sid)
+    context_results={r['action_id']:r for r in completed}
+    context_id=st.selectbox('参考历史分析（可选）',[None]+list(context_results),
+        format_func=lambda v:'不引用历史分析' if v is None else context_results[v]['question']+' · '+v[:8],key='context_'+sid)
+    prior=context_results.get(context_id,{})
+    intent_context={'parent_action_id':context_id,'parent_question':prior.get('question'),
+                    'scope':prior.get('scope'),'subject_assertion':(prior.get('confirmed_request') or {}).get('subject_assertion')}
+    if context_id:
+        st.caption('历史分析用于理解追问；本次查询按当前问题重新确定范围。继承具体记录群体请使用左侧“追问来源”。')
     peer_comparison = st.checkbox("明确请求同侪比较（需选择目标 UE 或 CRNTI）",value=False,key='peer_'+sid)
     submitted = st.button("开始分析",disabled=not(scope_valid and dataset_ok))
     if submitted and question.strip():
-        candidate=parse_question(question,scope)
+        with st.spinner('理解问题并核对数据范围…'):
+            candidate=resolve_question(question,scope,session['dataset_dir'],model=engine.model,context=intent_context)
+        for notice in candidate.get('notices',[]): st.info(notice)
         if not candidate['issues']:
             st.session_state.pop('question_candidate',None)
             try:
                 request=confirm_request(session['dataset_dir'],question,restore_scope(candidate['scope']),
                     [m['canonical_field'] for m in candidate['metrics']],candidate['trend'],
-                    single_subject=candidate.get('single_subject_statement',False),execution_mode='AUTO_FROM_QUESTION')
+                    single_subject=candidate.get('single_subject_statement',False),execution_mode='AUTO_FROM_QUESTION',
+                    intent_spec=candidate.get('intent_spec'))
                 st.caption(query_logic(request,bool(parent_action_id),peer_comparison))
                 run_question(question,peer_comparison=peer_comparison,confirmed_request=request)
             except (ValueError,TypeError) as exc:
                 st.error('无法确定查询范围：'+str(exc))
         else:
-            st.session_state["question_candidate"]={"candidate":candidate,"question":question,"context":request_identity([sid,scope_dict(scope),feature_path,parent_action_id,cohort_name,parent_event_id,peer_comparison])}
+            st.session_state["question_candidate"]={"candidate":candidate,"question":question,"context":request_identity([sid,scope_dict(scope),feature_path,parent_action_id,cohort_name,parent_event_id,peer_comparison,context_id])}
     draft=st.session_state.get("question_candidate")
-    context_token=request_identity([sid,scope_dict(scope),feature_path,parent_action_id,cohort_name,parent_event_id,peer_comparison])
+    context_token=request_identity([sid,scope_dict(scope),feature_path,parent_action_id,cohort_name,parent_event_id,peer_comparison,context_id])
     if draft and draft["question"]==question and draft["context"]==context_token and draft["candidate"]["mapping_hash"]==parse_question(question,scope)["mapping_hash"]:
         st.subheader("请修正查询歧义")
         candidate=draft["candidate"]
@@ -282,16 +295,24 @@ with middle:
             if edited[field] is not None:
                 try: edited[field]=int(edited[field],16) if edited[field].lower().startswith('0x') else int(edited[field])
                 except ValueError: st.error(field+'必须为整数')
-        selected_metrics=st.multiselect("分析指标",options=[m["canonical_field"] for m in question_mapping()[0]["fields"]],default=[m["canonical_field"] for m in candidate["metrics"]],key="metric_edit_"+request_identity(draft))
+        multi_cells=st.text_input('确认范围：多个小区（逗号分隔）',value=','.join(map(str,edited.get('logic_cell_ids') or [])),key=edit_key+'cells')
+        try:
+            edited['logic_cell_ids']=[int(v.strip()) for v in multi_cells.replace('，',',').split(',') if v.strip()] or None
+        except ValueError:
+            edited['logic_cell_ids']=['INVALID']; st.error('多个小区必须为逗号分隔的整数')
+        if edited.get('subjects'):
+            st.caption('问题中的成对对象约束：'+dumps(edited['subjects']))
+        metric_options=list(dict.fromkeys([m['canonical_field'] for m in question_mapping()[0]['fields']]+[m['canonical_field'] for m in candidate['metrics']]))
+        selected_metrics=st.multiselect("分析指标",options=metric_options,default=[m["canonical_field"] for m in candidate["metrics"]],key="metric_edit_"+request_identity(draft))
         trend=st.checkbox("按观测时间绘制折线图",value=candidate["trend"],key="trend_"+request_identity(draft))
         if candidate.get('single_subject_candidate'):
-            st.info('检测到多 CRNTI 同一用户说明，请确认仅适用于以下范围。若界面已筛选单个 CRNTI，请先清空或修改确认范围。')
-        single_subject=st.checkbox('我确认当前范围内所有 CRNTI 属于同一用户（仅本次分析）',value=False,key='subject_'+edit_key)
+            st.info('检测到多个对象属于同一用户的说明，请核对以下范围及成员。')
+        single_subject=st.checkbox('我确认当前范围内的对象属于同一用户（仅本次分析）',value=candidate.get('single_subject_statement',False),key='subject_'+edit_key)
         st.caption("TA单位/缩放待确认时展示原始值；文本中时间须在范围中明确填写，冲突须由你选择。")
         resolved=st.checkbox("我已明确上述歧义或冲突",key="resolve_"+request_identity(draft)) if candidate["issues"] else True
         try:
             selected_scope=restore_scope(edited)
-            preview=confirm_request(session["dataset_dir"],question,selected_scope,selected_metrics,trend,single_subject=single_subject)
+            preview=confirm_request(session["dataset_dir"],question,selected_scope,selected_metrics,trend,single_subject=single_subject,intent_spec=candidate.get('intent_spec'))
             st.write("基础范围预检（追问另受父证据群体约束）" if parent_action_id else "范围预检",preview["preflight"])
             if st.button("确认并分析",disabled=not resolved):
                 run_question(question,peer_comparison=peer_comparison,confirmed_request=preview)
@@ -396,18 +417,23 @@ with right:
                         search=st.text_input('筛选观测会话（可选）',key='chart_search_'+a['artifact_id'])
                         objects=chart_objects(a,search)
                         if len(objects)>500: st.info('超过500个对象，请用会话编号筛选；当前只列出前500个对象。')
-                        chosen=st.selectbox('选择小区 / 观测会话',objects[:500],format_func=lambda o:str(o[0])+' / '+str(o[1]),key='chart_object_'+a['artifact_id']) if objects else None
-                        points,coverage=time_coverage(a,*chosen) if chosen else (pd.DataFrame(),{})
+                        defaults=[]; seen_cells=set()
+                        for obj in objects[:500]:
+                            if obj[0] not in seen_cells and len(defaults)<12:
+                                defaults.append(obj); seen_cells.add(obj[0])
+                        defaults.extend(obj for obj in objects[:500] if obj not in defaults and len(defaults)<12)
+                        chosen=st.multiselect('联合查看小区 / 观测会话',objects[:500],default=defaults,format_func=lambda o:str(o[0])+' / '+str(o[1]),key='chart_objects_'+a['artifact_id']) if objects else []
+                        if len(objects)>12: st.caption('默认最多12个对象，优先覆盖不同小区；可调整选择。完整统计仍覆盖全部对象。')
+                        points,coverage=joint_time_coverage(a,chosen) if chosen else (pd.DataFrame(),{})
                         if not points.empty:
-                            points=points.sort_values(['logicCellId','ue_uid','segment','event_ts'],kind='stable')
-                            points['对象']=points.logicCellId.astype(str)+' / '+points.ue_uid.astype(str)
-                            points.loc[points.barrier,'value']=float('nan')
-                            fig=px.line(points,x='event_ts',y='value',color='对象',line_group='segment',markers=True,title=a['field']+' 时间折线图',labels={'event_ts':'观测时间','value':a['unit']})
-                            fig.update_traces(connectgaps=False)
-                            st.plotly_chart(fig,use_container_width=True,key=a['artifact_id'])
+                            if not points['value'].notna().any():
+                                st.warning('所选对象有观测记录，但预览中没有有效数值；请查看下方完整分组统计中的缺失、冲突和质量阻断。历史粗时间证据请重新分析。')
+                            for figure_idx,(fig,caption) in enumerate(metric_figures(points,a)):
+                                st.plotly_chart(fig,use_container_width=True,key=a['artifact_id']+'_'+str(figure_idx))
+                                st.caption(caption)
                         st.caption('当前对象的全时间范围覆盖预览：'+dumps(coverage)+'。段间不连线；降采样点不用于总体统计。')
                         st.dataframe(pd.DataFrame(a.get('group_statistics',[])),hide_index=True)
-                        st.caption('每个所选对象最多预览2000时点，完整统计：'+dumps(a['statistics'])+'。冲突/缺失断线，不推断间隔内过程。')
+                        st.caption('所选对象共享最多2000个预览点，完整统计：'+dumps(a['statistics'])+'。冲突/缺失断线，不推断间隔内过程。')
                     except (ValueError,OSError):
                         st.warning('时序证据校验失败，未绘图。')
             summary = result["summary"]

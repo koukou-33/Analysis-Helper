@@ -1,7 +1,7 @@
 """Shared deterministic intent candidates; execution uses the confirmed request."""
 import re
 
-VERSION = 'question-intents.v1'
+VERSION = 'question-intents.v2'
 
 
 def temporal_intent(question):
@@ -12,4 +12,12 @@ def temporal_intent(question):
 
 
 def single_subject_candidate(question):
-    return bool(re.search(r'(?:所有|不同|多个|各个)\s*crnti.*?(?:同一|一个)\s*用户',question,re.I))
+    return bool(re.search(r'(?:crnti|小区|跟踪|记录|接入).*?(?:同一(?:个)?|一个)\s*(?:物理)?用户',question,re.I))
+
+
+def single_subject_statement(question):
+    """Only explicit declarations; questions, hypotheses and negation are not evidence."""
+    for clause in re.split(r'[。；;?？]',question):
+        if single_subject_candidate(clause) and not re.search(r'是否|是不是|可能|假设|假如|不是|不属于|并非|不同用户|吗',clause):
+            return True
+    return False

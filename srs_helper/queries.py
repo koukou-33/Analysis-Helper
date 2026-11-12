@@ -18,8 +18,55 @@ class Scope:
     start: datetime | None = None
     end: datetime | None = None
     phy_cell_inst: int | None = None
+    logic_cell_ids: tuple[int, ...] | None = None
+    subjects: tuple[dict, ...] | None = None
+
+    def __post_init__(self):
+        # Omit absent additions from __dict__: legacy action/request hashes stay stable.
+        for name in ('logic_cell_ids', 'subjects'):
+            value = getattr(self, name)
+            if value is None:
+                object.__delattr__(self, name)
+            elif name == 'logic_cell_ids':
+                if not isinstance(value, (list, tuple)) or not value or len(value) > 256:
+                    raise ValueError('logic_cell_ids须包含1～256个小区编号')
+                if any(type(v) is not int or not 0 <= v <= 65535 for v in value):
+                    raise ValueError('logic_cell_ids必须为0..65535整数')
+                object.__setattr__(self, name, tuple(sorted(set(value))))
+            else:
+                if not isinstance(value, (list, tuple)) or not value or len(value) > 256:
+                    raise ValueError('subjects须包含1～256个对象选择条件')
+                normalized = []
+                allowed = {'logic_cell_id','crnti','ue_uid','resource_id','phy_cell_inst','start','end'}
+                for member in value:
+                    if not isinstance(member, dict) or set(member)-allowed:
+                        raise ValueError('对象选择包含未知字段')
+                    clean = {k:v for k,v in member.items() if v is not None}
+                    if not clean or not any(k in clean for k in allowed-{'start','end'}):
+                        raise ValueError('对象选择必须指定身份字段')
+                    for key in ('start','end'):
+                        if key in clean:
+                            timestamp = datetime.fromisoformat(clean[key]) if isinstance(clean[key],str) else clean[key]
+                            if not isinstance(timestamp,datetime) or timestamp.tzinfo is not None:
+                                raise ValueError('对象时间必须为数据本地时间')
+                            clean[key] = timestamp.isoformat()
+                    if clean.get('start') and clean.get('end') and datetime.fromisoformat(clean['start']) >= datetime.fromisoformat(clean['end']):
+                        raise ValueError('对象开始时间必须早于结束时间')
+                    normalized.append(clean)
+                normalized = {json.dumps(v,sort_keys=True):v for v in normalized}
+                object.__setattr__(self, name, tuple(normalized[k] for k in sorted(normalized)))
 
     def where(self):
+        def validate_identity(key, value):
+            if value is None:
+                return
+            if key == 'ue_uid':
+                if not isinstance(value,str) or not value or len(value)>512:
+                    raise ValueError('ue_uid必须为有效观测会话编号')
+            elif type(value) is not int or not 0 <= value <= 65535:
+                raise ValueError(key+'必须为0..65535整数')
+        for key in ('logic_cell_id','crnti','resource_id','phy_cell_inst','ue_uid'):
+            validate_identity(key,getattr(self,key))
         if any(value is not None and value.tzinfo is not None for value in (self.start, self.end)):
             raise ValueError("Use local timestamps without a timezone, matching the source CSV")
         if self.start and self.end and self.start >= self.end:
@@ -33,6 +80,25 @@ class Scope:
             if value is not None:
                 conditions.append(f"{column} {operator} ?")
                 parameters.append(value)
+        if self.logic_cell_ids is not None:
+            if self.logic_cell_id is not None and set(self.logic_cell_ids)!={self.logic_cell_id}:
+                raise ValueError('单小区与多小区范围冲突')
+            conditions.append('logicCellId IN ('+','.join('?' for _ in self.logic_cell_ids)+')')
+            parameters.extend(self.logic_cell_ids)
+        if self.subjects is not None:
+            members = []
+            columns = {'logic_cell_id':'logicCellId','crnti':'crnti','ue_uid':'ue_uid',
+                       'resource_id':'resourceId','phy_cell_inst':'phyCellInst','start':'event_ts','end':'event_ts'}
+            for member in self.subjects:
+                terms = []
+                for key,value in member.items():
+                    if key not in ('start','end'):
+                        validate_identity(key,value)
+                    operator = '>=' if key=='start' else '<' if key=='end' else '='
+                    terms.append(columns[key]+' '+operator+' ?')
+                    parameters.append(datetime.fromisoformat(value) if key in ('start','end') else value)
+                members.append('('+' AND '.join(terms)+')')
+            conditions.append('('+' OR '.join(members)+')')
         from .provenance import active_cohort
         if active_cohort.get() is not None:
             conditions.append('record_id IN (SELECT record_id FROM selected_cohort)')

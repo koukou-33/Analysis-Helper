@@ -80,3 +80,59 @@ def observation_figure(rows):
     frame['状态']=frame.state.map(labels).fillna('未知')
     return px.scatter(frame.sort_values('event_ts'),x='event_ts',y='ue_uid',color='状态',symbol='状态',
                       labels={'event_ts':'观测时间','ue_uid':'用户观测会话'},title='会话状态随时间的观测变化')
+
+
+def metric_figures(frame, artifact):
+    """Joint view of cell/resource series without pretending their counters are synced."""
+    if frame.empty:
+        return []
+    points=frame.copy()
+    points.loc[points['barrier'],'value']=float('nan')
+    points['小区']=points.logicCellId.astype(str)
+    unit=artifact.get('unit','原始值')
+    if not {'series_id','observation_index'}<=set(points.columns):
+        points=points.sort_values(['logicCellId','ue_uid','segment','event_ts'],kind='stable')
+        points['对象']=points['小区']+' / '+points.ue_uid.astype(str)
+        figure=px.line(points,x='event_ts',y='value',color='小区',line_group=points['对象']+' / '+points.segment.astype(str),
+                       markers=True,labels={'event_ts':'原始观测时间','value':unit},title=artifact.get('field','指标')+' 时间观测')
+        figure.update_traces(connectgaps=False)
+        return [(figure,'历史证据使用原始时间轴；秒内帧级观测需重新分析生成新证据。')]
+
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    points=points.sort_values(['logicCellId','ue_uid','series_id','observation_index'],kind='stable')
+    series=list(points.groupby('series_id',sort=False))
+    colors={cell:px.colors.qualitative.Plotly[i%len(px.colors.qualitative.Plotly)]
+            for i,cell in enumerate(sorted(points['小区'].unique()))}
+    charts=[]
+    # Bound each figure's height while retaining every selected resource series.
+    for offset in range(0,len(series),6):
+        batch=series[offset:offset+6]
+        titles=[]
+        for _,part in batch:
+            first=part.iloc[0]
+            titles.append(f"小区 {first['小区']} · {first['ue_uid']} · 资源 {first.get('resourceId','?')} · RB {first.get('freqRbStart','?')} / {first.get('freqRbNum','?')}")
+        figure=make_subplots(rows=len(batch),cols=1,shared_xaxes=False,subplot_titles=titles,
+                            vertical_spacing=min(.10,.30/len(batch)))
+        legends=set()
+        for row,(_,part) in enumerate(batch,1):
+            for _,segment in part.groupby('segment',sort=False):
+                cell=segment['小区'].iloc[0]
+                hover=[]
+                for _,p in segment.iterrows():
+                    hover.append(f"原始时间：{p['event_ts']}<br>帧/子帧/时隙：{p.get('frmNum')} / {p.get('subFrmNum')} / {p.get('slot')}"
+                                 f"<br>TTI：{p.get('uwTtiCnt1')}<br>来源：{p.get('source_file')} 行 {p.get('first_file_row_id')}～{p.get('last_file_row_id')}"
+                                 f"<br>顺序：{p.get('ordering_status')}<br>原始行数：{p.get('sample_cnt')}")
+                figure.add_trace(go.Scatter(x=segment.observation_index,y=segment.value,mode='lines+markers',
+                    name='小区 '+cell,legendgroup=cell,showlegend=cell not in legends,
+                    line={'color':colors[cell]},connectgaps=False,text=hover,
+                    hovertemplate='%{text}<br>值：%{y}<extra>%{fullData.name}</extra>'),row=row,col=1)
+                legends.add(cell)
+            ticks=part.iloc[::max(1,len(part)//10)].drop_duplicates('observation_index')
+            figure.update_xaxes(title_text='帧/子帧/时隙观测序列（非时间间隔）',tickmode='array',
+                tickvals=ticks.observation_index.tolist(),
+                ticktext=[f"{p.get('frmNum')} / {p.get('subFrmNum')} / {p.get('slot')}" for _,p in ticks.iterrows()],row=row,col=1)
+            figure.update_yaxes(title_text=unit,row=row,col=1)
+        figure.update_layout(height=max(330,250*len(batch)),title=artifact.get('field','指标')+' 多小区观测',margin={'t':90})
+        charts.append((figure,'各面板按来源文件与资源内的观测序列展示；帧号回绕、重置、缺测或顺序不明处断线。横轴间距不代表毫秒，面板之间不表示严格同步。'))
+    return charts

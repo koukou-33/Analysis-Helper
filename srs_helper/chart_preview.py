@@ -26,13 +26,18 @@ def chart_objects(artifact, search=''):
 
 def time_coverage(artifact, cell, ue_uid, limit=2000):
     """Pick per-segment time buckets' endpoints and extrema, never join across gaps."""
+    if not isinstance(limit,int) or limit<4:
+        raise ValueError('Chart preview limit must be at least four points')
     with chart_connection(artifact) as con:
         columns={r[0] for r in con.execute('DESCRIBE points').fetchall()}
         where='ue_uid=?'; params=[ue_uid]
         if 'logicCellId' in columns:
             where+=' AND cast(logicCellId AS VARCHAR)=?'; params.append(cell)
-        order='event_ts'+(',record_id' if 'record_id' in columns else '')
+        order=('series_id,observation_index' if {'series_id','observation_index'}<=columns
+               else 'event_ts'+(',record_id' if 'record_id' in columns else ''))
         segment='segment' if 'segment' in columns else 'segment_index' if 'segment_index' in columns else '0'
+        if 'series_id' in columns:
+            segment=f'dense_rank() OVER(ORDER BY series_id,{segment})'
         con.execute(f'CREATE TEMP TABLE chosen AS SELECT *, {segment} AS preview_segment FROM points WHERE {where}',params)
         total=con.execute('SELECT count(*) FROM chosen').fetchone()[0]
         if total<=limit:
@@ -61,3 +66,25 @@ def time_coverage(artifact, cell, ue_uid, limit=2000):
         frame=con.execute(sql).fetchdf()
         return frame,{'total_points':total,'shown_points':len(frame),'omitted_segments':len(segments)-len(selected),
                       'method':'SEGMENT_TIME_BUCKET_ENDPOINTS_EXTREMA','buckets_per_segment':per_segment}
+
+
+def joint_time_coverage(artifact, objects, limit=2000):
+    """Bounded preview of multiple selected objects; report omitted objects explicitly."""
+    if not isinstance(limit,int) or limit<4:
+        raise ValueError('Chart preview limit must be at least four points')
+    import pandas as pd
+    objects=list(dict.fromkeys(tuple(o) for o in objects))
+    if not objects:
+        return pd.DataFrame(),{'selected_objects':0,'shown_objects':0,'shown_points':0,'objects':[]}
+    maximum=max(1,limit//4)
+    selected=objects[:maximum]
+    per_object=max(4,limit//len(selected))
+    frames=[]; coverages=[]
+    for cell,uid in selected:
+        frame,coverage=time_coverage(artifact,cell,uid,limit=per_object)
+        frames.append(frame)
+        coverages.append({'cell':cell,'ue_uid':uid,**coverage})
+    frame=pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
+    return frame,{'selected_objects':len(objects),'shown_objects':len(selected),
+                  'omitted_objects':len(objects)-len(selected),'shown_points':len(frame),
+                  'method':'PER_OBJECT_SEGMENT_ENDPOINTS_EXTREMA','objects':coverages}
