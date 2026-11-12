@@ -40,6 +40,10 @@ def get_engine():
 
 
 engine = get_engine()
+contract_paths = sorted(path.as_posix() for path in Path("config").glob("*input_contract.json"))
+if "config/sample_input_contract.json" in contract_paths:
+    contract_paths.remove("config/sample_input_contract.json")
+    contract_paths.insert(0, "config/sample_input_contract.json")
 left,middle,right = st.columns([1,1.3,1.7])
 
 
@@ -70,7 +74,7 @@ with left:
         with st.form("load"):
             dataset_name = st.text_input("数据名称",placeholder="例如：南京站点 SPF 开启 · 10月29日",max_chars=100)
             input_path = st.text_input("目录或单个 CSV 路径",value="workspace_storage/synthetic_v1/normal")
-            contract_path = st.selectbox("输入契约",["config/sample_input_contract.json","config/input_contract.json"])
+            contract_path = st.selectbox("输入契约",contract_paths)
             load = st.form_submit_button("加载新数据版本")
         if load:
             try:
@@ -89,6 +93,8 @@ with left:
                     st.success("数据已加载："+meta["status"])
             except Exception as exc:
                 st.error("加载未完成："+type(exc).__name__+"。请检查路径、契约和文件内容。")
+                if isinstance(exc, ValueError):
+                    st.text(str(exc))
     sessions = engine.store.list()
     if sessions:
         session_ids = [s["id"] for s in sessions]
@@ -119,7 +125,7 @@ with left:
             reload_name=st.text_input('重新加载后的数据名称',value=selected['name'][:95]+' · 重载',
                 max_chars=100,key='reload_name_'+selected['dataset_id'])
             reload_contract=st.selectbox('重新加载输入契约',
-                ['沿用原输入格式与别名','config/sample_input_contract.json','config/input_contract.json'],
+                ['沿用原输入格式与别名',*contract_paths],
                 key='reload_contract_'+selected['dataset_id'])
             if st.button('重新加载数据'):
                 try:

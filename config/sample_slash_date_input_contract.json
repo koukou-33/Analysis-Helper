@@ -1,0 +1,11 @@
+{
+  "encoding": "utf-8-sig",
+  "delimiter": ",",
+  "date_format": "%Y/%m/%d",
+  "time_format": "%H:%M:%S",
+  "null_values": ["", "NULL", "null", "N/A"],
+  "required_identity_columns": ["uwTtiCnt1", "logicCellId", "crnti", "uwData", "uwTime"],
+  "flow_presence_column": "crnti",
+  "nullable_measurement_columns": ["usrRsrp", "srsUeNiDb"],
+  "field_mapping_file": "knowledge_assets/field_mappings/nr_srs_sample.json"
+}

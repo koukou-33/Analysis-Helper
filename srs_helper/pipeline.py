@@ -130,7 +130,8 @@ def build_dataset(input_dir, storage, contract, *, snapshot_files=None, reload_o
     if root.is_file():
         root = root.parent
     if not paths:
-        raise ValueError("No matching NR_SRS capture CSV files found")
+        raise ValueError("未找到符合命名规则的 NR_SRS CSV 文件。目录扫描不包含 NR_SRS_temp.csv 等临时文件名；"
+                         "如需加载自制示例，请在输入框填写完整 CSV 文件路径，而不是仅填写目录。")
     dataset_id = str(uuid.uuid4())
     build = storage / (".building-" + dataset_id)
     build.mkdir(parents=True)

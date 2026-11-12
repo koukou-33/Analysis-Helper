@@ -7,7 +7,7 @@ from typing import Literal
 from uuid import uuid4
 
 import pyarrow.parquet as pq
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator
 
 from .database import open_dataset
 from .queries import Scope
@@ -103,6 +103,16 @@ class QueryPlan(BaseModel):
     document_refs: list[dict] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     required_fields: list[str] = Field(default_factory=list, max_length=512)
+
+    @field_validator('steps', mode='before')
+    @classmethod
+    def normalize_step_models(cls, value):
+        # Streamlit may retain a cached engine while reloading the model module.
+        # Cross that boundary as data, then run the full current Step validation.
+        if isinstance(value, (list, tuple)):
+            return [step.model_dump(mode='python') if isinstance(step, BaseModel) else step
+                    for step in value]
+        return value
 
     @model_validator(mode="after")
     def dependencies(self):
